@@ -1,0 +1,115 @@
+@import "@simple-table/react/styles.css";
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'DM Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background-color: #F9F9F8;
+    color: #18181B;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Manrope', ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: -0.025em;
+  }
+}
+
+/* Custom theme for Simple Table */
+.theme-custom {
+  --st-border-color: #e2e8f0;
+  --st-border-radius: 12px;
+  --st-border-width: 1px;
+  --st-header-background-color: #f8fafc;
+  --st-header-label-color: #475569;
+  --st-header-icon-color: #64748b;
+  --st-header-selected-background-color: #f1f5f9;
+  --st-header-selected-label-color: #0f172a;
+  --st-header-selected-icon-color: #0f172a;
+  --st-cell-color: #0f172a;
+  --st-cell-odd-row-color: #0f172a;
+  --st-even-row-background-color: #ffffff;
+  --st-odd-row-background-color: #fafbfc;
+  --st-hover-row-background-color: #f1f5f9;
+  --st-selected-row-background-color: #eff6ff;
+  --st-selected-cell-background-color: #eff6ff;
+  --st-selected-cell-color: #1e40af;
+  --st-selected-first-cell-background-color: #dbeafe;
+  --st-selected-first-cell-color: #1e40af;
+  --st-selected-border-color: #3b82f6;
+  --st-button-hover-background-color: #f1f5f9;
+  --st-button-active-background-color: #0f172a;
+  --st-button-active-text-color: #ffffff;
+  --st-page-btn-color: #475569;
+  --st-next-prev-btn-color: #475569;
+  --st-next-prev-btn-disabled-color: #cbd5e1;
+  --st-checkbox-background-color: #ffffff;
+  --st-checkbox-border-color: #cbd5e1;
+  --st-checkbox-checked-background-color: #0f172a;
+  --st-checkbox-checked-border-color: #0f172a;
+  --st-focus-ring-color: #0f172a;
+  --st-resize-handle-color: #cbd5e1;
+  --st-resize-handle-selected-color: #3b82f6;
+  --st-footer-background-color: #ffffff;
+  --st-footer-text-color: #64748b;
+  --st-loading-skeleton-bg-color: #e2e8f0;
+  --st-scrollbar-bg-color: #f8fafc;
+  --st-scrollbar-thumb-color: #cbd5e1;
+  --st-cell-padding: 10px 14px;
+  --st-overlay-padding: 12px;
+  --st-overlay-font-size: 13px;
+  --st-control-padding-x: 10px;
+  --st-control-padding-y: 6px;
+}
+
+.theme-custom .st-header-label-text {
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.theme-custom .st-cell-content {
+  font-size: 12px;
+  width: 100%;
+}
+
+.theme-custom .st-wrapper {
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Custom focus ring for high contrast controls */
+.erp-focus:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #FFFFFF, 0 0 0 4px #18181B;
+}
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.6); opacity: 0.8; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+.pulse-active {
+  position: relative;
+}
+.pulse-active::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 9999px;
+  border: 2px solid currentColor;
+  opacity: 0.5;
+  animation: pulse-ring 1.8s cubic-bezier(0.25, 1, 0.5, 1) infinite;
+}
+
