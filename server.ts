@@ -35,15 +35,7 @@ app.use(async (req, res, next) => {
   next();
 });
 
-// Root & API status endpoints for health check
-app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "Mini ERP Backend API",
-    timestamp: new Date().toISOString()
-  });
-});
-
+// API status endpoint for health check
 app.get("/api", (req, res) => {
   res.json({
     status: "ok",
