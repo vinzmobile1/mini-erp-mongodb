@@ -9,11 +9,22 @@ import { client, db, initDatabase, seedDatabase, clearAllData, clearTransactions
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const app = express();
 let idCounter = Date.now() * 10;
 const generateId = () => ++idCounter;
 const server = http.createServer(app);
+
+// CORS middleware for cross-origin frontend support (e.g., Netlify -> Render)
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
 // Real-time Clients: WebSocket & Server-Sent Events (SSE)
 const wss = new WebSocketServer({ server, path: "/api/ws" });
