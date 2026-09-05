@@ -47,24 +47,29 @@ class RealtimeClient {
   public connect() {
     if (typeof window === "undefined") return;
 
-    // 1. Connect via Server-Sent Events (SSE) - 100% rock-solid across all proxies, Cloud Run, Safari, Chrome & mobile
-    this.connectSSE();
+    const apiBase = import.meta.env.VITE_API_BASE_URL
+      ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, "")
+      : (typeof window !== "undefined" ? window.location.origin : "");
+
+    // 1. Connect via Server-Sent Events (SSE)
+    this.connectSSE(apiBase);
 
     // 2. Also try WebSocket if supported
-    this.connectWS();
+    this.connectWS(apiBase);
 
     // 3. Start background sync fallback
     this.startBackgroundSync();
   }
 
-  private connectSSE() {
+  private connectSSE(apiBase: string) {
     if (typeof EventSource === "undefined") return;
     if (this.eventSource && this.eventSource.readyState !== EventSource.CLOSED) {
       return;
     }
 
     try {
-      this.eventSource = new EventSource("/api/events");
+      const sseUrl = `${apiBase}/api/events`;
+      this.eventSource = new EventSource(sseUrl);
 
       this.eventSource.onopen = () => {
         this.setStatus("connected");
@@ -80,25 +85,39 @@ class RealtimeClient {
       };
 
       this.eventSource.onerror = () => {
-        // EventSource will automatically retry connecting natively
-        if (this.status !== "connected" && (!this.ws || this.ws.readyState !== WebSocket.OPEN)) {
+        // If SSE fails (e.g. serverless Vercel returns HTML or fails stream), close gracefully to avoid error spam
+        if (this.eventSource) {
+          try {
+            this.eventSource.close();
+          } catch {}
+          this.eventSource = null;
+        }
+        if (this.status !== "connected") {
           this.setStatus("connecting");
         }
       };
     } catch (err) {
-      console.warn("SSE init error:", err);
+      // SSE init error
     }
   }
 
-  private connectWS() {
+  private connectWS(apiBase: string) {
     if (typeof WebSocket === "undefined") return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/api/ws`;
+    let wsUrl = "";
+    if (apiBase.startsWith("https://")) {
+      wsUrl = apiBase.replace("https://", "wss://") + "/api/ws";
+    } else if (apiBase.startsWith("http://")) {
+      wsUrl = apiBase.replace("http://", "ws://") + "/api/ws";
+    } else if (typeof window !== "undefined") {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      wsUrl = `${protocol}//${window.location.host}/api/ws`;
+    }
+
+    if (!wsUrl) return;
 
     try {
       this.ws = new WebSocket(wsUrl);
@@ -119,23 +138,21 @@ class RealtimeClient {
 
       this.ws.onclose = () => {
         this.stopHeartbeat();
-        // If SSE is open, we are still connected!
         if (!this.eventSource || this.eventSource.readyState !== EventSource.OPEN) {
           this.setStatus("connecting");
         }
-        this.scheduleReconnect();
       };
 
       this.ws.onerror = () => {
-        // Silently close without throwing unhandled rejection
         if (this.ws) {
           try {
             this.ws.close();
           } catch {}
+          this.ws = null;
         }
       };
     } catch {
-      // WS failed, SSE will handle real-time sync
+      // WS failed, background polling handles sync
     }
   }
 
