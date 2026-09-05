@@ -15,13 +15,23 @@ let idCounter = Date.now() * 10;
 const generateId = () => ++idCounter;
 const server = http.createServer(app);
 
-// CORS middleware for cross-origin frontend support (e.g., Netlify -> Render)
+// CORS middleware for cross-origin frontend support (e.g., Netlify -> Render / Vercel)
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
+  }
+  next();
+});
+
+// Auto-connect MongoDB in Serverless environments (Vercel)
+app.use(async (req, res, next) => {
+  try {
+    await initDatabase();
+  } catch (err) {
+    console.error("Database connection error in request handler:", err);
   }
   next();
 });
@@ -1605,3 +1615,5 @@ async function start() {
   });
 }
 start();
+
+export default app;
