@@ -2,7 +2,6 @@ import express, { Request, Response } from "express";
 import http from "http";
 import path from "path";
 import { WebSocketServer, WebSocket } from "ws";
-import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { ObjectId } from "mongodb";
 import { client, db, initDatabase, seedDatabase, clearAllData, clearTransactionsOnly, getDbInfo, getCollectionIndexes } from "./server/db";
@@ -1603,6 +1602,7 @@ async function start() {
     console.error("Initial MongoDB connection error:", err);
   }
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
@@ -1614,6 +1614,10 @@ async function start() {
     console.log(`🚀 Mini ERP Server running on http://localhost:${PORT}`);
   });
 }
-start();
+
+// Only run standalone server in non-serverless environments
+if (!process.env.VERCEL && !process.env.NOW_REGION) {
+  start();
+}
 
 export default app;
