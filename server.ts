@@ -35,6 +35,23 @@ app.use(async (req, res, next) => {
   next();
 });
 
+// Root & API status endpoints for health check
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "Mini ERP Backend API",
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get("/api", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "Mini ERP Backend API",
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Real-time Clients: WebSocket & Server-Sent Events (SSE)
 const wss = new WebSocketServer({ server, path: "/api/ws" });
 const wsClients = new Set<WebSocket>();
