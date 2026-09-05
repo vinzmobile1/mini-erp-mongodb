@@ -51,6 +51,16 @@ class RealtimeClient {
       ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, "")
       : (typeof window !== "undefined" ? window.location.origin : "");
 
+    const isVercel = apiBase.includes("vercel.app");
+
+    // Vercel Serverless does not support persistent WebSockets or long-lived SSE streams.
+    // Use background sync directly to maintain synchronization without console errors.
+    if (isVercel) {
+      this.setStatus("connected");
+      this.startBackgroundSync();
+      return;
+    }
+
     // 1. Connect via Server-Sent Events (SSE)
     this.connectSSE(apiBase);
 

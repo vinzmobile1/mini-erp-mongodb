@@ -53,32 +53,35 @@ app.get("/api", (req, res) => {
 });
 
 // Real-time Clients: WebSocket & Server-Sent Events (SSE)
-const wss = new WebSocketServer({ server, path: "/api/ws" });
+let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
 const sseClients = new Set<Response>();
 
-wss.on("connection", (ws) => {
-  wsClients.add(ws);
-  try {
-    ws.send(JSON.stringify({ type: "connection:ready", payload: { activeClients: wsClients.size + sseClients.size } }));
-  } catch {}
-
-  ws.on("message", (msg) => {
+if (!process.env.VERCEL && !process.env.NOW_REGION) {
+  wss = new WebSocketServer({ server, path: "/api/ws" });
+  wss.on("connection", (ws) => {
+    wsClients.add(ws);
     try {
-      const data = JSON.parse(msg.toString());
-      if (data.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong", time: Date.now() }));
-      }
+      ws.send(JSON.stringify({ type: "connection:ready", payload: { activeClients: wsClients.size + sseClients.size } }));
     } catch {}
-  });
 
-  ws.on("close", () => {
-    wsClients.delete(ws);
+    ws.on("message", (msg) => {
+      try {
+        const data = JSON.parse(msg.toString());
+        if (data.type === "ping") {
+          ws.send(JSON.stringify({ type: "pong", time: Date.now() }));
+        }
+      } catch {}
+    });
+
+    ws.on("close", () => {
+      wsClients.delete(ws);
+    });
+    ws.on("error", () => {
+      wsClients.delete(ws);
+    });
   });
-  ws.on("error", () => {
-    wsClients.delete(ws);
-  });
-});
+}
 
 // Real-time Event System (Stateless & Redis Pub/Sub Ready)
 // In a distributed/multi-instance deployment, connect to Redis Pub/Sub (e.g. ioredis)
