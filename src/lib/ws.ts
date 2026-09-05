@@ -8,6 +8,7 @@ class RealtimeClient {
   private reconnectTimeout: any = null;
   private pingInterval: any = null;
   private pollingInterval: any = null;
+  private isServerless = false;
   private processedEvents = new Map<string, number>(); // _eventId -> timestamp for deduplication
   public status: "connected" | "connecting" | "disconnected" = "disconnected";
 
@@ -51,10 +52,11 @@ class RealtimeClient {
       ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, "")
       : (typeof window !== "undefined" ? window.location.origin : "");
 
-    const isVercel = apiBase.includes("vercel.app");
+    const isVercel = apiBase.includes("vercel.app") || (typeof window !== "undefined" && window.location.hostname.includes("vercel.app"));
+    this.isServerless = isVercel;
 
     // Vercel Serverless does not support persistent WebSockets or long-lived SSE streams.
-    // Use background sync directly to maintain synchronization without console errors.
+    // Use active background sync polling to maintain synchronization without console errors.
     if (isVercel) {
       this.setStatus("connected");
       this.startBackgroundSync();
@@ -221,12 +223,17 @@ class RealtimeClient {
 
   private startBackgroundSync() {
     if (this.pollingInterval) return;
-    // Periodic silent sync every 12 seconds ONLY if connection dropped completely (fallback)
+    // Periodic silent sync:
+    // - Every 5 seconds on Vercel serverless to catch cross-tab updates from MongoDB Atlas
+    // - Every 12 seconds fallback on long-lived connections if disconnected
+    const intervalMs = this.isServerless ? 5000 : 12000;
     this.pollingInterval = setInterval(() => {
-      if (document.visibilityState === "visible" && this.status !== "connected") {
-        this.notifyListeners({ type: "sync:refresh", payload: { reason: "periodic" } });
+      if (typeof document !== "undefined" && document.visibilityState === "visible") {
+        if (this.isServerless || this.status !== "connected") {
+          this.notifyListeners({ type: "sync:refresh", payload: { reason: "periodic" } });
+        }
       }
-    }, 12000);
+    }, intervalMs);
   }
 
   private scheduleReconnect() {
