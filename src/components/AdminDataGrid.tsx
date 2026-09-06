@@ -37,6 +37,7 @@ import { OrderDetailSidebar } from "./OrderDetailSidebar";
 import { ConfirmModal } from "./ConfirmModal";
 import { SalesPerson, Product, Brand, Customer } from "../types";
 import { QuickFilterGroup, QuickFilterOption } from "./QuickFilterGroup";
+import { wsClient } from "../lib/ws";
 
 interface AdminDataGridProps {
   orders: InvoiceOrder[];
@@ -243,6 +244,52 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
     fetchFirstPage();
   }, [fetchFirstPage]);
 
+  // Realtime synchronization: listen for status changes, new orders, notes, and deletions live across clients
+  useEffect(() => {
+    const unsubscribe = wsClient.subscribe((event) => {
+      const eventType = event.type;
+      const payload = event.payload || {};
+      const targetInvoice = payload.no_invoice || payload.invoice || payload.id;
+
+      if (eventType === "order:status" || eventType === "invoice:status") {
+        const newStatus = payload.status as OrderStatus;
+        if (targetInvoice && newStatus) {
+          // Immediately update invoice status in table without waiting for refetch
+          setInvoices((prev) =>
+            prev.map((inv) =>
+              inv.no_invoice === targetInvoice ? { ...inv, status: newStatus } : inv
+            )
+          );
+        }
+        // Immediately refresh summary badges live
+        fetchSummaryCounts();
+
+        // If filtering by a specific status, refetch current page so orders entering/leaving update
+        if (statusFilter !== "ALL") {
+          fetchFirstPage(true);
+        }
+      } else if (
+        eventType === "order:created" ||
+        eventType === "invoice:created" ||
+        eventType === "order:imported" ||
+        eventType === "order:updated" ||
+        eventType === "invoice:updated" ||
+        eventType === "sync:refresh"
+      ) {
+        fetchFirstPage(true);
+        fetchSummaryCounts();
+      } else if (eventType === "order:deleted" || eventType === "invoice:deleted") {
+        if (targetInvoice) {
+          setInvoices((prev) => prev.filter((inv) => inv.no_invoice !== targetInvoice));
+        }
+        fetchFirstPage(true);
+        fetchSummaryCounts();
+      }
+    });
+
+    return () => unsubscribe();
+  }, [fetchFirstPage, fetchSummaryCounts, statusFilter]);
+
   const hasActiveSearch = useMemo(() => {
     return Boolean(
       debouncedSearch.invoice ||
@@ -253,16 +300,12 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
     );
   }, [debouncedSearch]);
 
-  // Sync initial orders prop if loaded externally and no active filters (preserve optimistic status changes)
+  // Sync initial orders prop if loaded externally and no active filters
   useEffect(() => {
     if (orders && orders.length > 0 && !hasActiveSearch && !startDate && !endDate && statusFilter === "ALL" && channelFilter === "ALL") {
       setInvoices((prev: InvoiceOrder[]) => {
         if (!prev || prev.length === 0) return orders;
-        const prevMap = new Map<string, InvoiceOrder>(prev.map((i: InvoiceOrder) => [i.no_invoice, i]));
-        return orders.map((ord: InvoiceOrder) => {
-          const existing = prevMap.get(ord.no_invoice);
-          return existing ? { ...ord, status: existing.status } : ord;
-        });
+        return orders;
       });
     }
   }, [orders, hasActiveSearch, startDate, endDate, statusFilter, channelFilter]);

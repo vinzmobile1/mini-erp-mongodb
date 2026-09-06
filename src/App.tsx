@@ -22,9 +22,10 @@ import {
   InvoiceOrder,
 } from "./types";
 import { api } from "./lib/api";
-import { wsClient } from "./lib/ws";
+import { wsClient, useWebSocketSync } from "./lib/ws";
 
 export default function App() {
+  useWebSocketSync();
   const [activeTab, setActiveTab] = useState<string>("dashboard");
   const [currentRole, setCurrentRole] = useState<AppRole>("Admin");
   const [editingInvoice, setEditingInvoice] = useState<SalesOrder | null>(null);
@@ -122,19 +123,29 @@ export default function App() {
       refetchOrders();
       refetchAnalytics();
       if (shouldRefreshMaster) refetchMaster();
-    }, 500); // 500ms debounce
+    }, 80); // Snappy 80ms sync debounce
   }, [refetchOrders, refetchAnalytics, refetchMaster]);
 
   // Realtime Socket.io / WebSockets Subscriber
   useEffect(() => {
     const unsubscribeWs = wsClient.subscribe((event) => {
+      const payload = event.payload || {};
+      const inv = payload.no_invoice || payload.invoice || payload.id || payload.order?.no_invoice;
+
       if (event.type === "sync:refresh") {
         scheduleDebouncedSync(true);
-      } else if (event.type === "order:created" || event.type === "order:deleted" || event.type === "invoice:deleted") {
+      } else if (
+        event.type === "order:created" ||
+        event.type === "invoice:created" ||
+        event.type === "order:imported" ||
+        event.type === "order:updated" ||
+        event.type === "invoice:updated" ||
+        event.type === "order:deleted" ||
+        event.type === "invoice:deleted"
+      ) {
         scheduleDebouncedSync(false);
       } else if (event.type === "order:status" || event.type === "invoice:status") {
-        const inv = event.payload?.no_invoice || event.payload?.order?.no_invoice;
-        const newStatus = event.payload?.status;
+        const newStatus = payload.status;
         if (inv && newStatus) {
           updateOrderStatusOptimistic(inv, newStatus);
         }

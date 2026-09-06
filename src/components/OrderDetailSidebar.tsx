@@ -37,7 +37,7 @@ import {
   Customer,
 } from "../types";
 import { api, formatRupiah, formatDate, parseDateToTimestamp } from "../lib/api";
-import { wsClient } from "../lib/ws";
+import { wsClient, useWebSocketSync } from "../lib/ws";
 import { getChannelColor, getStatusColor, getDynamicBadgeStyle } from "../lib/colorUtils";
 import { ConfirmModal } from "./ConfirmModal";
 import { InputOrderForm } from "./InputOrderForm";
@@ -718,6 +718,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
   brands = [],
   customers = [],
 }) => {
+  useWebSocketSync();
   const queryClient = useQueryClient();
 
   const [isEditingMode, setIsEditingMode] = useState(false);
@@ -788,27 +789,48 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
     return map;
   }, [channels]);
 
-  // 2. Realtime WebSocket listener to sync notes or updates live
+  // 2. Realtime WebSocket listener to sync notes, status, history, and updates live
   useEffect(() => {
     if (!isOpen || !invoiceNumber) return;
     const unsubscribe = wsClient.subscribe((event) => {
-      if (event.type === "invoice:note" && event.payload?.no_invoice === invoiceNumber) {
-        const incomingNote: OrderNote = event.payload.note;
-        queryClient.setQueryData<InvoiceDetailResponse>(["invoiceDetail", invoiceNumber], (prev) => {
-          if (!prev) return prev;
-          const currentNotes = prev.notes || [];
-          const tempIdx = currentNotes.findIndex(
-            (n) => String(n.id).startsWith("temp-") && n.note === incomingNote.note && n.author === incomingNote.author
-          );
-          if (tempIdx !== -1) {
-            const updated = [...currentNotes];
-            updated[tempIdx] = incomingNote;
-            return { ...prev, notes: updated };
-          }
-          const exists = currentNotes.some((n) => String(n.id) === String(incomingNote.id));
-          if (exists) return prev;
-          return { ...prev, notes: [...currentNotes, incomingNote] };
-        });
+      const payload = event.payload || {};
+      const targetInvoice = payload.no_invoice || payload.invoice || payload.id;
+
+      if (event.type === "invoice:note" && targetInvoice === invoiceNumber) {
+        const incomingNote: OrderNote = payload.note;
+        if (incomingNote) {
+          queryClient.setQueryData<InvoiceDetailResponse>(["invoiceDetail", invoiceNumber], (prev) => {
+            if (!prev) return prev;
+            const currentNotes = prev.notes || [];
+            const tempIdx = currentNotes.findIndex(
+              (n) => String(n.id).startsWith("temp-") && n.note === incomingNote.note && n.author === incomingNote.author
+            );
+            if (tempIdx !== -1) {
+              const updated = [...currentNotes];
+              updated[tempIdx] = incomingNote;
+              return { ...prev, notes: updated };
+            }
+            const exists = currentNotes.some((n) => String(n.id) === String(incomingNote.id));
+            if (exists) return prev;
+            return { ...prev, notes: [...currentNotes, incomingNote] };
+          });
+        }
+      } else if ((event.type === "invoice:status" || event.type === "order:status") && targetInvoice === invoiceNumber) {
+        const newStatus = payload.status as OrderStatus;
+        if (newStatus) {
+          queryClient.setQueryData<InvoiceDetailResponse>(["invoiceDetail", invoiceNumber], (prev) => {
+            if (!prev || !prev.invoice) return prev;
+            const updatedHistory = payload.history || prev.history || [];
+            return {
+              ...prev,
+              invoice: { ...prev.invoice, status: newStatus },
+              history: updatedHistory,
+              items: (prev.items || []).map((it) => ({ ...it, status: newStatus })),
+            };
+          });
+        }
+      } else if ((event.type === "order:updated" || event.type === "invoice:updated") && targetInvoice === invoiceNumber) {
+        queryClient.invalidateQueries({ queryKey: ["invoiceDetail", invoiceNumber] });
       }
     });
     return () => unsubscribe();

@@ -100,6 +100,9 @@ export function broadcast(event: { type: string; payload: any }) {
   for (const res of sseClients) {
     try {
       res.write(sseChunk);
+      if (typeof (res as any).flush === "function") {
+        (res as any).flush();
+      }
     } catch (err) {
       sseClients.delete(res);
     }
@@ -293,6 +296,7 @@ app.post("/api/import/master", async (req: Request, res: Response) => {
     }
 
     const durationMs = Date.now() - startTime;
+    invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "master:updated", payload: { action: "import", counts } });
     res.json({ ok: true, message: `Import master data berhasil.`, counts, durationMs });
   } catch (err: any) {
@@ -380,6 +384,7 @@ app.post("/api/import/orders", async (req: Request, res: Response) => {
       await salesCol.bulkWrite(bulkOps, { ordered: false });
     }
 
+    invalidateOrdersAndAnalyticsCache();
     const durationMs = Date.now() - startTime;
     broadcast({ type: "order:imported", payload: { importedInvoicesCount, importedItemsCount, totalImportedAmount } });
     res.json({ ok: true, importedInvoicesCount, importedItemsCount, totalImportedAmount, skippedInvoices, durationMs });
@@ -520,6 +525,7 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
         if (doc.sku) doc.sku = String(doc.sku).trim().toUpperCase();
         if (doc.urutan) doc.urutan = Number(doc.urutan);
         await db.collection(collection).insertOne(doc);
+        invalidateOrdersAndAnalyticsCache();
         broadcast({ type: "master:updated", payload: { table: collection, item: doc } });
         res.status(201).json(doc);
       } catch (err: any) { res.status(400).json({ error: err.message }); }
@@ -533,6 +539,7 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
         if (updateDoc.urutan !== undefined) updateDoc.urutan = Number(updateDoc.urutan);
         await db.collection(collection).updateOne({ [idField]: id }, { $set: updateDoc });
         const updated = await db.collection(collection).findOne({ [idField]: id }, { projection: { _id: 0 } });
+        invalidateOrdersAndAnalyticsCache();
         broadcast({ type: "master:updated", payload: { table: collection, item: updated } });
         res.json(updated);
       } catch (err: any) { res.status(400).json({ error: err.message }); }
@@ -559,6 +566,7 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
           await db.collection("products").deleteMany({ brand_id: id });
         }
 
+        invalidateOrdersAndAnalyticsCache();
         broadcast({ type: "master:updated", payload: { table: collection, deletedId: id } });
         res.json({ ok: true, id, deletedCount: result.deletedCount });
       } catch (err: any) { res.status(500).json({ error: err.message }); }
@@ -661,11 +669,61 @@ function setInCache(keyPrefix: string, key: string, data: any, ttlSeconds: numbe
   currentCacheBytes += sizeBytes;
 }
 
+function invalidateCacheByPattern(pattern: string): number {
+  let count = 0;
+  for (const [k, v] of apiCache.entries()) {
+    if (k.includes(pattern)) {
+      currentCacheBytes = Math.max(0, currentCacheBytes - v.sizeBytes);
+      apiCache.delete(k);
+      count++;
+    }
+  }
+  if (count > 0) {
+    console.log(`[CACHE] Invalidated ${count} entries matching "${pattern}"`);
+  }
+  return count;
+}
+
+// Saat ada perubahan data, buang cache yang sudah usang
+function invalidateCacheForDataChange(dataType: "invoice" | "note" | "status" | "all") {
+  switch (dataType) {
+    case "status":
+      // Buang: invoices list, summary, orders, analytics, detail
+      invalidateCacheByPattern("invoices");
+      invalidateCacheByPattern("invoices-summary");
+      invalidateCacheByPattern("orders");
+      invalidateCacheByPattern("analytics-summary");
+      invalidateCacheByPattern("invoiceDetail");
+      break;
+    case "note":
+      // Buang: invoice detail, summary
+      invalidateCacheByPattern("invoiceDetail");
+      invalidateCacheByPattern("invoices-summary");
+      break;
+    case "invoice":
+      // Buang: invoice detail, invoices list, summary, orders, analytics
+      invalidateCacheByPattern("invoiceDetail");
+      invalidateCacheByPattern("invoices");
+      invalidateCacheByPattern("invoices-summary");
+      invalidateCacheByPattern("orders");
+      invalidateCacheByPattern("analytics-summary");
+      break;
+    case "all":
+    default:
+      invalidateOrdersAndAnalyticsCache();
+      break;
+  }
+}
+
 let productMapCache: { map: Map<string, string>; expiry: number } | null = null;
 function invalidateOrdersAndAnalyticsCache() {
   productMapCache = null;
+  const count = apiCache.size;
   apiCache.clear();
   currentCacheBytes = 0;
+  if (count > 0) {
+    console.log(`[CACHE] Invalidated all ${count} entries`);
+  }
 }
 async function getProductNameMap(): Promise<Map<string, string>> {
   if (productMapCache && Date.now() < productMapCache.expiry) {
@@ -823,7 +881,7 @@ app.get("/api/invoices-summary", async (req: Request, res: Response) => {
     }
 
     const result = { total: totalCount, statusCounts, channelCounts };
-    setInCache("invoices-summary", cacheKey, result, 120); // 2 min cache
+    setInCache("invoices-summary", cacheKey, result, 5); // 5s short cache for burst deduplication
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -982,6 +1040,9 @@ app.get("/api/invoices", async (req: Request, res: Response) => {
 app.get("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
   try {
     const no_invoice = decodeURIComponent(req.params.no_invoice);
+    const cached = getFromCache("invoiceDetail", no_invoice);
+    if (cached) return res.json(cached);
+
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Invoice not found" });
 
@@ -1013,12 +1074,15 @@ app.get("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
 
     const flatOrderArr = await fetchFlatOrders({ no_invoice: doc.no_invoice });
     
-    res.json({
+    const responsePayload = {
       invoice,
       items: flatOrderArr, // the flat items array expected by frontend
       history: doc.history || [],
       notes: doc.notes || []
-    });
+    };
+
+    setInCache("invoiceDetail", no_invoice, responsePayload, 60);
+    res.json(responsePayload);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1035,7 +1099,7 @@ app.get("/api/orders", async (req: Request, res: Response) => {
     const flat = await fetchFlatOrders(filter);
     const result = limit === "all" ? flat : flat.slice(0, Number(limit));
     
-    setInCache("orders", req.originalUrl, result, 30);
+    setInCache("orders", req.originalUrl, result, 5);
     res.json(result);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
@@ -1089,9 +1153,11 @@ app.post("/api/orders", async (req: Request, res: Response) => {
     };
 
     await db.collection("sales").insertOne(doc);
+    invalidateCacheForDataChange("invoice");
     
     const flat = await fetchFlatOrders({ no_invoice });
-    broadcast({ type: "order:created", payload: { invoice: no_invoice } });
+    broadcast({ type: "order:created", payload: { invoice: no_invoice, no_invoice } });
+    broadcast({ type: "invoice:created", payload: { no_invoice } });
     res.status(201).json(flat);
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1173,8 +1239,9 @@ app.put("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
 
     await db.collection("sales").updateOne({ no_invoice }, { $set: updateData });
 
-    invalidateOrdersAndAnalyticsCache();
-    broadcast({ type: "order:updated", payload: { invoice: updateData.no_invoice, history } });
+    invalidateCacheForDataChange("invoice");
+    broadcast({ type: "order:updated", payload: { invoice: updateData.no_invoice, no_invoice: updateData.no_invoice, history } });
+    broadcast({ type: "invoice:updated", payload: { no_invoice: updateData.no_invoice, invoice: updateData.no_invoice, history } });
     res.json({ ok: true, history, orders: await fetchFlatOrders({ no_invoice: updateData.no_invoice }) });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1200,8 +1267,9 @@ app.patch("/api/invoices/:no_invoice/status", async (req: Request, res: Response
     });
 
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status, history } });
-    invalidateOrdersAndAnalyticsCache();
-    broadcast({ type: "invoice:status", payload: { no_invoice, status, history } });
+    invalidateCacheForDataChange("status");
+    broadcast({ type: "invoice:status", payload: { no_invoice, id: no_invoice, status, history } });
+    broadcast({ type: "order:status", payload: { id: no_invoice, no_invoice, status, history } });
     res.json({ ok: true, no_invoice, status, history });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1227,8 +1295,9 @@ app.patch("/api/orders/:id/status", async (req: Request, res: Response) => {
       updated_at: new Date()
     });
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status, history } });
-    invalidateOrdersAndAnalyticsCache();
-    broadcast({ type: "order:status", payload: { id, status, oldStatus: doc.status, history } });
+    invalidateCacheForDataChange("status");
+    broadcast({ type: "order:status", payload: { id, no_invoice, status, oldStatus: doc.status, history } });
+    broadcast({ type: "invoice:status", payload: { no_invoice, id, status, history } });
     res.json({ ok: true, status, history });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1253,8 +1322,9 @@ app.post("/api/invoices/:no_invoice/advance", async (req: Request, res: Response
       updated_at: new Date()
     });
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status: nextStatus, history } });
-    invalidateOrdersAndAnalyticsCache();
-    broadcast({ type: "invoice:status", payload: { no_invoice, status: nextStatus, history } });
+    invalidateCacheForDataChange("status");
+    broadcast({ type: "invoice:status", payload: { no_invoice, id: no_invoice, status: nextStatus, history } });
+    broadcast({ type: "order:status", payload: { id: no_invoice, no_invoice, status: nextStatus, oldStatus: doc.status, history } });
     res.json({ ok: true, status: nextStatus, history });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1299,8 +1369,9 @@ app.post("/api/orders/:id/advance", async (req: Request, res: Response) => {
     });
     
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status: nextStatus, history } });
-    invalidateOrdersAndAnalyticsCache();
-    broadcast({ type: "order:status", payload: { id: rawId, status: nextStatus, oldStatus: doc.status } });
+    invalidateCacheForDataChange("status");
+    broadcast({ type: "order:status", payload: { id: rawId, no_invoice, status: nextStatus, oldStatus: doc.status, history } });
+    broadcast({ type: "invoice:status", payload: { no_invoice, id: rawId, status: nextStatus, history } });
     res.json({ ok: true, status: nextStatus });
   } catch (err: any) { 
     res.status(400).json({ error: err.message }); 
@@ -1345,7 +1416,7 @@ app.post("/api/invoices/:no_invoice/notes", async (req: Request, res: Response) 
       { no_invoice },
       { $push: { notes: noteObj } as any }
     );
-    invalidateOrdersAndAnalyticsCache();
+    invalidateCacheForDataChange("note");
     broadcast({ type: "invoice:note", payload: { no_invoice, note: noteObj } });
     res.status(201).json(noteObj);
   } catch (err: any) { res.status(400).json({ error: err.message }); }
@@ -1355,7 +1426,7 @@ app.delete("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
   try {
     const no_invoice = decodeURIComponent(req.params.no_invoice);
     const result = await db.collection("sales").deleteOne({ no_invoice });
-    invalidateOrdersAndAnalyticsCache();
+    invalidateCacheForDataChange("invoice");
     broadcast({ type: "invoice:deleted", payload: { no_invoice } });
     broadcast({ type: "order:deleted", payload: { no_invoice } });
     res.json({ ok: true, no_invoice, deletedCount: result.deletedCount });
@@ -1371,7 +1442,7 @@ app.delete("/api/orders/:id", async (req: Request, res: Response) => {
       if (match) no_invoice = match[0];
     }
     const result = await db.collection("sales").deleteOne({ no_invoice });
-    invalidateOrdersAndAnalyticsCache();
+    invalidateCacheForDataChange("invoice");
     broadcast({ type: "invoice:deleted", payload: { no_invoice } });
     broadcast({ type: "order:deleted", payload: { id: rawId, no_invoice } });
     res.json({ ok: true, no_invoice, deletedCount: result.deletedCount });
@@ -1696,9 +1767,29 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
       daily_sales,
     };
 
-    setInCache("analytics-summary", cacheKey, summaryData, 120); // 2 min cache
+    setInCache("analytics-summary", cacheKey, summaryData, 10); // 10s cache
     res.json(summaryData);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/api/metrics", (req: Request, res: Response) => {
+  try {
+    const keys = Array.from(apiCache.keys());
+    res.json({
+      status: "ok",
+      cache: {
+        entries: apiCache.size,
+        currentCacheBytes,
+        currentCacheMB: Number((currentCacheBytes / (1024 * 1024)).toFixed(2)),
+        maxCacheMB: MAX_CACHE_MB,
+        keys: keys.slice(0, 50),
+      },
+      clients: sseClients.size,
+      uptimeSeconds: Math.floor(process.uptime()),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 async function start() {

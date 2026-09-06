@@ -1,3 +1,6 @@
+import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+
 type EventCallback = (event: { type: string; payload: any }) => void;
 
 class RealtimeClient {
@@ -272,4 +275,105 @@ class RealtimeClient {
 
 export const wsClient = new RealtimeClient();
 export const realtimeClient = wsClient;
+
+/**
+ * useWebSocketSync
+ * Listens to live WebSocket/SSE events and merges updates directly into
+ * the React Query cache (e.g. invoiceDetail, notes, status, lists, metrics)
+ * without requiring a full page refresh.
+ */
+export function useWebSocketSync() {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    const unsubscribe = wsClient.subscribe((event) => {
+      const { type, payload } = event;
+      if (!payload) return;
+
+      const noInvoice = payload.no_invoice || payload.invoice || payload.id;
+
+      switch (type) {
+        case "invoice:status":
+        case "order:status": {
+          const newStatus = payload.status;
+          if (noInvoice && newStatus) {
+            // 1. Live merge into invoice detail in React Query cache
+            queryClient.setQueryData<any>(["invoiceDetail", noInvoice], (prev: any) => {
+              if (!prev || !prev.invoice) return prev;
+              const updatedHistory = payload.history || prev.history || [];
+              return {
+                ...prev,
+                invoice: { ...prev.invoice, status: newStatus },
+                history: updatedHistory,
+                items: (prev.items || []).map((it: any) => ({ ...it, status: newStatus })),
+              };
+            });
+
+            // 2. Invalidate aggregate list and summary queries
+            queryClient.invalidateQueries({ queryKey: ["invoices"] });
+            queryClient.invalidateQueries({ queryKey: ["invoices-summary"] });
+            queryClient.invalidateQueries({ queryKey: ["orders"] });
+            queryClient.invalidateQueries({ queryKey: ["analytics-summary"] });
+          }
+          break;
+        }
+
+        case "invoice:note": {
+          const incomingNote = payload.note;
+          if (noInvoice && incomingNote) {
+            queryClient.setQueryData<any>(["invoiceDetail", noInvoice], (prev: any) => {
+              if (!prev) return prev;
+              const currentNotes = prev.notes || [];
+              const tempIdx = currentNotes.findIndex(
+                (n: any) =>
+                  String(n.id).startsWith("temp-") &&
+                  n.note === incomingNote.note &&
+                  n.author === incomingNote.author
+              );
+              if (tempIdx !== -1) {
+                const updated = [...currentNotes];
+                updated[tempIdx] = incomingNote;
+                return { ...prev, notes: updated };
+              }
+              const exists = currentNotes.some((n: any) => String(n.id) === String(incomingNote.id));
+              if (exists) return prev;
+              return { ...prev, notes: [...currentNotes, incomingNote] };
+            });
+          }
+          break;
+        }
+
+        case "invoice:updated":
+        case "order:updated": {
+          if (noInvoice) {
+            queryClient.invalidateQueries({ queryKey: ["invoiceDetail", noInvoice] });
+            queryClient.invalidateQueries({ queryKey: ["invoices"] });
+            queryClient.invalidateQueries({ queryKey: ["invoices-summary"] });
+            queryClient.invalidateQueries({ queryKey: ["orders"] });
+          }
+          break;
+        }
+
+        case "invoice:created":
+        case "order:created":
+        case "order:imported":
+        case "invoice:deleted":
+        case "order:deleted":
+        case "sync:refresh": {
+          queryClient.invalidateQueries({ queryKey: ["invoices"] });
+          queryClient.invalidateQueries({ queryKey: ["invoices-summary"] });
+          queryClient.invalidateQueries({ queryKey: ["orders"] });
+          queryClient.invalidateQueries({ queryKey: ["analytics-summary"] });
+          break;
+        }
+
+        default:
+          break;
+      }
+    });
+
+    return () => unsubscribe();
+  }, [queryClient]);
+}
+
 
