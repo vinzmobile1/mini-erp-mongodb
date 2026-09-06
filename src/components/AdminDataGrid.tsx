@@ -37,7 +37,6 @@ import { OrderDetailSidebar } from "./OrderDetailSidebar";
 import { ConfirmModal } from "./ConfirmModal";
 import { SalesPerson, Product, Brand, Customer } from "../types";
 import { QuickFilterGroup, QuickFilterOption } from "./QuickFilterGroup";
-import { wsClient } from "../lib/ws";
 
 interface AdminDataGridProps {
   orders: InvoiceOrder[];
@@ -244,52 +243,6 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
     fetchFirstPage();
   }, [fetchFirstPage]);
 
-  // Realtime synchronization: listen for status changes, new orders, notes, and deletions live across clients
-  useEffect(() => {
-    const unsubscribe = wsClient.subscribe((event) => {
-      const eventType = event.type;
-      const payload = event.payload || {};
-      const targetInvoice = payload.no_invoice || payload.invoice || payload.id;
-
-      if (eventType === "order:status" || eventType === "invoice:status") {
-        const newStatus = payload.status as OrderStatus;
-        if (targetInvoice && newStatus) {
-          // Immediately update invoice status in table without waiting for refetch
-          setInvoices((prev) =>
-            prev.map((inv) =>
-              inv.no_invoice === targetInvoice ? { ...inv, status: newStatus } : inv
-            )
-          );
-        }
-        // Immediately refresh summary badges live
-        fetchSummaryCounts();
-
-        // If filtering by a specific status, refetch current page so orders entering/leaving update
-        if (statusFilter !== "ALL") {
-          fetchFirstPage(true);
-        }
-      } else if (
-        eventType === "order:created" ||
-        eventType === "invoice:created" ||
-        eventType === "order:imported" ||
-        eventType === "order:updated" ||
-        eventType === "invoice:updated" ||
-        eventType === "sync:refresh"
-      ) {
-        fetchFirstPage(true);
-        fetchSummaryCounts();
-      } else if (eventType === "order:deleted" || eventType === "invoice:deleted") {
-        if (targetInvoice) {
-          setInvoices((prev) => prev.filter((inv) => inv.no_invoice !== targetInvoice));
-        }
-        fetchFirstPage(true);
-        fetchSummaryCounts();
-      }
-    });
-
-    return () => unsubscribe();
-  }, [fetchFirstPage, fetchSummaryCounts, statusFilter]);
-
   const hasActiveSearch = useMemo(() => {
     return Boolean(
       debouncedSearch.invoice ||
@@ -300,12 +253,16 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
     );
   }, [debouncedSearch]);
 
-  // Sync initial orders prop if loaded externally and no active filters
+  // Sync initial orders prop if loaded externally and no active filters (preserve optimistic status changes)
   useEffect(() => {
     if (orders && orders.length > 0 && !hasActiveSearch && !startDate && !endDate && statusFilter === "ALL" && channelFilter === "ALL") {
       setInvoices((prev: InvoiceOrder[]) => {
         if (!prev || prev.length === 0) return orders;
-        return orders;
+        const prevMap = new Map<string, InvoiceOrder>(prev.map((i: InvoiceOrder) => [i.no_invoice, i]));
+        return orders.map((ord: InvoiceOrder) => {
+          const existing = prevMap.get(ord.no_invoice);
+          return existing ? { ...ord, status: existing.status } : ord;
+        });
       });
     }
   }, [orders, hasActiveSearch, startDate, endDate, statusFilter, channelFilter]);
@@ -391,14 +348,14 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
     },
     onMutate: async ({ no_invoice, nextStatus }) => {
       setAdvancingInvoice(no_invoice);
-      // Cancel outgoing refetches so they don't overwrite our optimistic update
-      await queryClient.cancelQueries({ queryKey: ["invoices"] });
-
       // Save snapshot of previous invoices
       const previousInvoices = invoices;
 
-      // Optimistically update local state
+      // Optimistically update local state immediately (0ms instant response)
       handleLocalUpdateStatusOptimistic(no_invoice, nextStatus);
+
+      // Cancel outgoing refetches in background so they don't overwrite our optimistic update
+      queryClient.cancelQueries({ queryKey: ["invoices"] });
 
       return { previousInvoices };
     },

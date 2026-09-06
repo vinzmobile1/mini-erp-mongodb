@@ -18,9 +18,7 @@ import {
   StatusHistory,
 } from "../types";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL
-  ? `${import.meta.env.VITE_API_BASE_URL.replace(/\/$/, "")}/api`
-  : "/api";
+const API_BASE = "/api";
 
 async function request<T>(endpoint: string, options?: RequestInit, retries = 2): Promise<T> {
   try {

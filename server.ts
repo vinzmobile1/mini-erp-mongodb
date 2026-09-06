@@ -2,78 +2,46 @@ import express, { Request, Response } from "express";
 import http from "http";
 import path from "path";
 import { WebSocketServer, WebSocket } from "ws";
+import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { ObjectId } from "mongodb";
 import { client, db, initDatabase, seedDatabase, clearAllData, clearTransactionsOnly, getDbInfo, getCollectionIndexes } from "./server/db";
 
 dotenv.config();
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = 3000;
 const app = express();
 let idCounter = Date.now() * 10;
 const generateId = () => ++idCounter;
 const server = http.createServer(app);
 
-// CORS middleware for cross-origin frontend support (e.g., Netlify -> Render / Vercel)
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
-  next();
-});
-
-// Auto-connect MongoDB in Serverless environments (Vercel)
-app.use(async (req, res, next) => {
-  try {
-    await initDatabase();
-  } catch (err) {
-    console.error("Database connection error in request handler:", err);
-  }
-  next();
-});
-
-// API status endpoint for health check
-app.get("/api", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "Mini ERP Backend API",
-    timestamp: new Date().toISOString()
-  });
-});
-
 // Real-time Clients: WebSocket & Server-Sent Events (SSE)
-let wss: WebSocketServer | null = null;
+const wss = new WebSocketServer({ server, path: "/api/ws" });
 const wsClients = new Set<WebSocket>();
 const sseClients = new Set<Response>();
 
-if (!process.env.VERCEL && !process.env.NOW_REGION) {
-  wss = new WebSocketServer({ server, path: "/api/ws" });
-  wss.on("connection", (ws) => {
-    wsClients.add(ws);
+wss.on("connection", (ws) => {
+  wsClients.add(ws);
+  try {
+    ws.send(JSON.stringify({ type: "connection:ready", payload: { activeClients: wsClients.size + sseClients.size } }));
+  } catch {}
+
+  ws.on("message", (msg) => {
     try {
-      ws.send(JSON.stringify({ type: "connection:ready", payload: { activeClients: wsClients.size + sseClients.size } }));
+      const data = JSON.parse(msg.toString());
+      if (data.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong", time: Date.now() }));
+      }
     } catch {}
-
-    ws.on("message", (msg) => {
-      try {
-        const data = JSON.parse(msg.toString());
-        if (data.type === "ping") {
-          ws.send(JSON.stringify({ type: "pong", time: Date.now() }));
-        }
-      } catch {}
-    });
-
-    ws.on("close", () => {
-      wsClients.delete(ws);
-    });
-    ws.on("error", () => {
-      wsClients.delete(ws);
-    });
   });
-}
+
+  ws.on("close", () => {
+    wsClients.delete(ws);
+  });
+  ws.on("error", () => {
+    wsClients.delete(ws);
+  });
+});
 
 // Real-time Event System (Stateless & Redis Pub/Sub Ready)
 // In a distributed/multi-instance deployment, connect to Redis Pub/Sub (e.g. ioredis)
@@ -100,9 +68,6 @@ export function broadcast(event: { type: string; payload: any }) {
   for (const res of sseClients) {
     try {
       res.write(sseChunk);
-      if (typeof (res as any).flush === "function") {
-        (res as any).flush();
-      }
     } catch (err) {
       sseClients.delete(res);
     }
@@ -296,7 +261,6 @@ app.post("/api/import/master", async (req: Request, res: Response) => {
     }
 
     const durationMs = Date.now() - startTime;
-    invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "master:updated", payload: { action: "import", counts } });
     res.json({ ok: true, message: `Import master data berhasil.`, counts, durationMs });
   } catch (err: any) {
@@ -384,7 +348,6 @@ app.post("/api/import/orders", async (req: Request, res: Response) => {
       await salesCol.bulkWrite(bulkOps, { ordered: false });
     }
 
-    invalidateOrdersAndAnalyticsCache();
     const durationMs = Date.now() - startTime;
     broadcast({ type: "order:imported", payload: { importedInvoicesCount, importedItemsCount, totalImportedAmount } });
     res.json({ ok: true, importedInvoicesCount, importedItemsCount, totalImportedAmount, skippedInvoices, durationMs });
@@ -525,7 +488,6 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
         if (doc.sku) doc.sku = String(doc.sku).trim().toUpperCase();
         if (doc.urutan) doc.urutan = Number(doc.urutan);
         await db.collection(collection).insertOne(doc);
-        invalidateOrdersAndAnalyticsCache();
         broadcast({ type: "master:updated", payload: { table: collection, item: doc } });
         res.status(201).json(doc);
       } catch (err: any) { res.status(400).json({ error: err.message }); }
@@ -539,7 +501,6 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
         if (updateDoc.urutan !== undefined) updateDoc.urutan = Number(updateDoc.urutan);
         await db.collection(collection).updateOne({ [idField]: id }, { $set: updateDoc });
         const updated = await db.collection(collection).findOne({ [idField]: id }, { projection: { _id: 0 } });
-        invalidateOrdersAndAnalyticsCache();
         broadcast({ type: "master:updated", payload: { table: collection, item: updated } });
         res.json(updated);
       } catch (err: any) { res.status(400).json({ error: err.message }); }
@@ -566,7 +527,6 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
           await db.collection("products").deleteMany({ brand_id: id });
         }
 
-        invalidateOrdersAndAnalyticsCache();
         broadcast({ type: "master:updated", payload: { table: collection, deletedId: id } });
         res.json({ ok: true, id, deletedCount: result.deletedCount });
       } catch (err: any) { res.status(500).json({ error: err.message }); }
@@ -614,116 +574,20 @@ async function getNextOrderStatus(currentStatus: string): Promise<string | null>
   return null;
 }
 
-interface CacheEntry {
-  data: any;
-  expiry: number;
-  sizeBytes: number;
+const apiCache = new Map<string, { data: any; expiry: number }>();
+function getFromCache(keyPrefix: string, url: string): any | null {
+  const item = apiCache.get(`${keyPrefix}:${url}`);
+  if (item && Date.now() < item.expiry) return item.data;
+  return null;
 }
-
-const apiCache = new Map<string, CacheEntry>();
-const MAX_CACHE_MB = 15;
-const MAX_CACHE_BYTES = MAX_CACHE_MB * 1024 * 1024;
-let currentCacheBytes = 0;
-
-function roughSize(object: any): number {
-  try {
-    const str = typeof object === "string" ? object : JSON.stringify(object);
-    return str ? str.length * 2 : 1024;
-  } catch {
-    return 1024;
-  }
-}
-
-function getFromCache(keyPrefix: string, key: string): any | null {
-  const fullKey = `${keyPrefix}:${key}`;
-  const item = apiCache.get(fullKey);
-  if (!item) return null;
-  if (Date.now() > item.expiry) {
-    currentCacheBytes = Math.max(0, currentCacheBytes - item.sizeBytes);
-    apiCache.delete(fullKey);
-    return null;
-  }
-  return item.data;
-}
-
-function setInCache(keyPrefix: string, key: string, data: any, ttlSeconds: number) {
-  const fullKey = `${keyPrefix}:${key}`;
-  const existing = apiCache.get(fullKey);
-  if (existing) {
-    currentCacheBytes = Math.max(0, currentCacheBytes - existing.sizeBytes);
-  }
-  const sizeBytes = roughSize(data);
-
-  // Auto-eviction if cache exceeds MAX_CACHE_MB
-  if (currentCacheBytes + sizeBytes > MAX_CACHE_BYTES) {
-    const now = Date.now();
-    for (const [k, v] of apiCache.entries()) {
-      if (v.expiry < now || currentCacheBytes + sizeBytes > MAX_CACHE_BYTES) {
-        currentCacheBytes = Math.max(0, currentCacheBytes - v.sizeBytes);
-        apiCache.delete(k);
-      }
-    }
-  }
-
-  apiCache.set(fullKey, { data, expiry: Date.now() + ttlSeconds * 1000, sizeBytes });
-  currentCacheBytes += sizeBytes;
-}
-
-function invalidateCacheByPattern(pattern: string): number {
-  let count = 0;
-  for (const [k, v] of apiCache.entries()) {
-    if (k.includes(pattern)) {
-      currentCacheBytes = Math.max(0, currentCacheBytes - v.sizeBytes);
-      apiCache.delete(k);
-      count++;
-    }
-  }
-  if (count > 0) {
-    console.log(`[CACHE] Invalidated ${count} entries matching "${pattern}"`);
-  }
-  return count;
-}
-
-// Saat ada perubahan data, buang cache yang sudah usang
-function invalidateCacheForDataChange(dataType: "invoice" | "note" | "status" | "all") {
-  switch (dataType) {
-    case "status":
-      // Buang: invoices list, summary, orders, analytics, detail
-      invalidateCacheByPattern("invoices");
-      invalidateCacheByPattern("invoices-summary");
-      invalidateCacheByPattern("orders");
-      invalidateCacheByPattern("analytics-summary");
-      invalidateCacheByPattern("invoiceDetail");
-      break;
-    case "note":
-      // Buang: invoice detail, summary
-      invalidateCacheByPattern("invoiceDetail");
-      invalidateCacheByPattern("invoices-summary");
-      break;
-    case "invoice":
-      // Buang: invoice detail, invoices list, summary, orders, analytics
-      invalidateCacheByPattern("invoiceDetail");
-      invalidateCacheByPattern("invoices");
-      invalidateCacheByPattern("invoices-summary");
-      invalidateCacheByPattern("orders");
-      invalidateCacheByPattern("analytics-summary");
-      break;
-    case "all":
-    default:
-      invalidateOrdersAndAnalyticsCache();
-      break;
-  }
+function setInCache(keyPrefix: string, url: string, data: any, ttlSeconds: number) {
+  apiCache.set(`${keyPrefix}:${url}`, { data, expiry: Date.now() + ttlSeconds * 1000 });
 }
 
 let productMapCache: { map: Map<string, string>; expiry: number } | null = null;
 function invalidateOrdersAndAnalyticsCache() {
   productMapCache = null;
-  const count = apiCache.size;
   apiCache.clear();
-  currentCacheBytes = 0;
-  if (count > 0) {
-    console.log(`[CACHE] Invalidated all ${count} entries`);
-  }
 }
 async function getProductNameMap(): Promise<Map<string, string>> {
   if (productMapCache && Date.now() < productMapCache.expiry) {
@@ -738,26 +602,9 @@ async function getProductNameMap(): Promise<Map<string, string>> {
   return map;
 }
 
-// Helper to flatten orders for frontend with targeted database projection (exclude notes, history, heavy customer snapshot)
+// Helper to flatten orders for frontend with targeted database projection
 async function fetchFlatOrders(query: any) {
-  const docs = await db.collection("sales").find(query, {
-    projection: {
-      no_invoice: 1,
-      nama_customer: 1,
-      no_telepon: 1,
-      alamat: 1,
-      "customer_snapshot.no_telepon": 1,
-      "customer_snapshot.alamat": 1,
-      channel: 1,
-      status: 1,
-      nama_sales: 1,
-      nama_divisi: 1,
-      created_at: 1,
-      "items.sku": 1,
-      "items.qty": 1,
-      "items.amount": 1,
-    }
-  }).sort({ created_at: -1 }).toArray();
+  const docs = await db.collection("sales").find(query).sort({ created_at: -1 }).toArray();
   if (docs.length === 0) return [];
 
   // Extract unique SKUs present in these documents
@@ -835,10 +682,6 @@ function parseWibDateRange(startDateParam?: any, endDateParam?: any) {
 // --- 1. ENDPOINT SUMMARY (Memperbaiki Bug Angka Badge Filter) ---
 app.get("/api/invoices-summary", async (req: Request, res: Response) => {
   try {
-    const cacheKey = req.originalUrl || req.url;
-    const cached = getFromCache("invoices-summary", cacheKey);
-    if (cached) return res.json(cached);
-
     const { startDate, endDate, channel, status } = req.query;
     let filter: any = {};
 
@@ -880,9 +723,7 @@ app.get("/api/invoices-summary", async (req: Request, res: Response) => {
       if (c._id) channelCounts[c._id] = c.count;
     }
 
-    const result = { total: totalCount, statusCounts, channelCounts };
-    setInCache("invoices-summary", cacheKey, result, 5); // 5s short cache for burst deduplication
-    res.json(result);
+    res.json({ total: totalCount, statusCounts, channelCounts });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -971,25 +812,6 @@ app.get("/api/invoices", async (req: Request, res: Response) => {
     }
     fallbackPipeline.push({ $sort: { created_at: -1, _id: -1 } });
     fallbackPipeline.push({ $limit: limitNum + 1 });
-    fallbackPipeline.push({
-      $project: {
-        no_invoice: 1,
-        nama_customer: 1,
-        no_telepon: 1,
-        alamat: 1,
-        "customer_snapshot.no_telepon": 1,
-        "customer_snapshot.alamat": 1,
-        channel: 1,
-        status: 1,
-        nama_sales: 1,
-        nama_divisi: 1,
-        created_at: 1,
-        "items.sku": 1,
-        "items.item_name": 1,
-        "items.qty": 1,
-        "items.amount": 1,
-      }
-    });
 
     const docs = await db.collection("sales").aggregate(fallbackPipeline).toArray();
 
@@ -1040,9 +862,6 @@ app.get("/api/invoices", async (req: Request, res: Response) => {
 app.get("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
   try {
     const no_invoice = decodeURIComponent(req.params.no_invoice);
-    const cached = getFromCache("invoiceDetail", no_invoice);
-    if (cached) return res.json(cached);
-
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Invoice not found" });
 
@@ -1074,15 +893,12 @@ app.get("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
 
     const flatOrderArr = await fetchFlatOrders({ no_invoice: doc.no_invoice });
     
-    const responsePayload = {
+    res.json({
       invoice,
       items: flatOrderArr, // the flat items array expected by frontend
       history: doc.history || [],
       notes: doc.notes || []
-    };
-
-    setInCache("invoiceDetail", no_invoice, responsePayload, 60);
-    res.json(responsePayload);
+    });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1099,7 +915,7 @@ app.get("/api/orders", async (req: Request, res: Response) => {
     const flat = await fetchFlatOrders(filter);
     const result = limit === "all" ? flat : flat.slice(0, Number(limit));
     
-    setInCache("orders", req.originalUrl, result, 5);
+    setInCache("orders", req.originalUrl, result, 30);
     res.json(result);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
@@ -1153,11 +969,9 @@ app.post("/api/orders", async (req: Request, res: Response) => {
     };
 
     await db.collection("sales").insertOne(doc);
-    invalidateCacheForDataChange("invoice");
     
     const flat = await fetchFlatOrders({ no_invoice });
-    broadcast({ type: "order:created", payload: { invoice: no_invoice, no_invoice } });
-    broadcast({ type: "invoice:created", payload: { no_invoice } });
+    broadcast({ type: "order:created", payload: { invoice: no_invoice } });
     res.status(201).json(flat);
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1239,9 +1053,8 @@ app.put("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
 
     await db.collection("sales").updateOne({ no_invoice }, { $set: updateData });
 
-    invalidateCacheForDataChange("invoice");
-    broadcast({ type: "order:updated", payload: { invoice: updateData.no_invoice, no_invoice: updateData.no_invoice, history } });
-    broadcast({ type: "invoice:updated", payload: { no_invoice: updateData.no_invoice, invoice: updateData.no_invoice, history } });
+    invalidateOrdersAndAnalyticsCache();
+    broadcast({ type: "order:updated", payload: { invoice: updateData.no_invoice, history } });
     res.json({ ok: true, history, orders: await fetchFlatOrders({ no_invoice: updateData.no_invoice }) });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1267,9 +1080,8 @@ app.patch("/api/invoices/:no_invoice/status", async (req: Request, res: Response
     });
 
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status, history } });
-    invalidateCacheForDataChange("status");
-    broadcast({ type: "invoice:status", payload: { no_invoice, id: no_invoice, status, history } });
-    broadcast({ type: "order:status", payload: { id: no_invoice, no_invoice, status, history } });
+    invalidateOrdersAndAnalyticsCache();
+    broadcast({ type: "invoice:status", payload: { no_invoice, status, history } });
     res.json({ ok: true, no_invoice, status, history });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1295,9 +1107,8 @@ app.patch("/api/orders/:id/status", async (req: Request, res: Response) => {
       updated_at: new Date()
     });
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status, history } });
-    invalidateCacheForDataChange("status");
-    broadcast({ type: "order:status", payload: { id, no_invoice, status, oldStatus: doc.status, history } });
-    broadcast({ type: "invoice:status", payload: { no_invoice, id, status, history } });
+    invalidateOrdersAndAnalyticsCache();
+    broadcast({ type: "order:status", payload: { id, status, oldStatus: doc.status, history } });
     res.json({ ok: true, status, history });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1322,9 +1133,8 @@ app.post("/api/invoices/:no_invoice/advance", async (req: Request, res: Response
       updated_at: new Date()
     });
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status: nextStatus, history } });
-    invalidateCacheForDataChange("status");
-    broadcast({ type: "invoice:status", payload: { no_invoice, id: no_invoice, status: nextStatus, history } });
-    broadcast({ type: "order:status", payload: { id: no_invoice, no_invoice, status: nextStatus, oldStatus: doc.status, history } });
+    invalidateOrdersAndAnalyticsCache();
+    broadcast({ type: "invoice:status", payload: { no_invoice, status: nextStatus, history } });
     res.json({ ok: true, status: nextStatus, history });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
 });
@@ -1369,9 +1179,7 @@ app.post("/api/orders/:id/advance", async (req: Request, res: Response) => {
     });
     
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status: nextStatus, history } });
-    invalidateCacheForDataChange("status");
-    broadcast({ type: "order:status", payload: { id: rawId, no_invoice, status: nextStatus, oldStatus: doc.status, history } });
-    broadcast({ type: "invoice:status", payload: { no_invoice, id: rawId, status: nextStatus, history } });
+    broadcast({ type: "order:status", payload: { id: rawId, status: nextStatus, oldStatus: doc.status } });
     res.json({ ok: true, status: nextStatus });
   } catch (err: any) { 
     res.status(400).json({ error: err.message }); 
@@ -1416,7 +1224,7 @@ app.post("/api/invoices/:no_invoice/notes", async (req: Request, res: Response) 
       { no_invoice },
       { $push: { notes: noteObj } as any }
     );
-    invalidateCacheForDataChange("note");
+    invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "invoice:note", payload: { no_invoice, note: noteObj } });
     res.status(201).json(noteObj);
   } catch (err: any) { res.status(400).json({ error: err.message }); }
@@ -1426,7 +1234,7 @@ app.delete("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
   try {
     const no_invoice = decodeURIComponent(req.params.no_invoice);
     const result = await db.collection("sales").deleteOne({ no_invoice });
-    invalidateCacheForDataChange("invoice");
+    invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "invoice:deleted", payload: { no_invoice } });
     broadcast({ type: "order:deleted", payload: { no_invoice } });
     res.json({ ok: true, no_invoice, deletedCount: result.deletedCount });
@@ -1442,7 +1250,7 @@ app.delete("/api/orders/:id", async (req: Request, res: Response) => {
       if (match) no_invoice = match[0];
     }
     const result = await db.collection("sales").deleteOne({ no_invoice });
-    invalidateCacheForDataChange("invoice");
+    invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "invoice:deleted", payload: { no_invoice } });
     broadcast({ type: "order:deleted", payload: { id: rawId, no_invoice } });
     res.json({ ok: true, no_invoice, deletedCount: result.deletedCount });
@@ -1451,10 +1259,6 @@ app.delete("/api/orders/:id", async (req: Request, res: Response) => {
 
 app.get("/api/analytics/summary", async (req: Request, res: Response) => {
   try {
-    const cacheKey = req.originalUrl || req.url;
-    const cached = getFromCache("analytics-summary", cacheKey);
-    if (cached) return res.json(cached);
-
     const range = (req.query.range as string) || "this_month";
 
     // Use Jakarta (WIB / UTC+7) date formatting for accurate local business reporting
@@ -1767,29 +1571,8 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
       daily_sales,
     };
 
-    setInCache("analytics-summary", cacheKey, summaryData, 10); // 10s cache
     res.json(summaryData);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
-});
-
-app.get("/api/metrics", (req: Request, res: Response) => {
-  try {
-    const keys = Array.from(apiCache.keys());
-    res.json({
-      status: "ok",
-      cache: {
-        entries: apiCache.size,
-        currentCacheBytes,
-        currentCacheMB: Number((currentCacheBytes / (1024 * 1024)).toFixed(2)),
-        maxCacheMB: MAX_CACHE_MB,
-        keys: keys.slice(0, 50),
-      },
-      clients: sseClients.size,
-      uptimeSeconds: Math.floor(process.uptime()),
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 async function start() {
@@ -1799,7 +1582,6 @@ async function start() {
     console.error("Initial MongoDB connection error:", err);
   }
   if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
@@ -1811,10 +1593,4 @@ async function start() {
     console.log(`🚀 Mini ERP Server running on http://localhost:${PORT}`);
   });
 }
-
-// Only run standalone server in non-serverless environments
-if (!process.env.VERCEL && !process.env.NOW_REGION) {
-  start();
-}
-
-export default app;
+start();

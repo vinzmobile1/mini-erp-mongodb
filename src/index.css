@@ -113,3 +113,11 @@
   animation: pulse-ring 1.8s cubic-bezier(0.25, 1, 0.5, 1) infinite;
 }
 
+/* Optimization for smooth, non-stuttering sidebar scrolling */
+.smooth-scroll-container {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  will-change: scroll-position;
+  contain: paint layout;
+}
+

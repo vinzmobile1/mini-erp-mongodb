@@ -1,6 +1,3 @@
-import { useEffect } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-
 type EventCallback = (event: { type: string; payload: any }) => void;
 
 class RealtimeClient {
@@ -11,7 +8,6 @@ class RealtimeClient {
   private reconnectTimeout: any = null;
   private pingInterval: any = null;
   private pollingInterval: any = null;
-  private isServerless = false;
   private processedEvents = new Map<string, number>(); // _eventId -> timestamp for deduplication
   public status: "connected" | "connecting" | "disconnected" = "disconnected";
 
@@ -51,40 +47,24 @@ class RealtimeClient {
   public connect() {
     if (typeof window === "undefined") return;
 
-    const apiBase = import.meta.env.VITE_API_BASE_URL
-      ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, "")
-      : (typeof window !== "undefined" ? window.location.origin : "");
-
-    const isVercel = apiBase.includes("vercel.app") || (typeof window !== "undefined" && window.location.hostname.includes("vercel.app"));
-    this.isServerless = isVercel;
-
-    // Vercel Serverless does not support persistent WebSockets or long-lived SSE streams.
-    // Use active background sync polling to maintain synchronization without console errors.
-    if (isVercel) {
-      this.setStatus("connected");
-      this.startBackgroundSync();
-      return;
-    }
-
-    // 1. Connect via Server-Sent Events (SSE)
-    this.connectSSE(apiBase);
+    // 1. Connect via Server-Sent Events (SSE) - 100% rock-solid across all proxies, Cloud Run, Safari, Chrome & mobile
+    this.connectSSE();
 
     // 2. Also try WebSocket if supported
-    this.connectWS(apiBase);
+    this.connectWS();
 
     // 3. Start background sync fallback
     this.startBackgroundSync();
   }
 
-  private connectSSE(apiBase: string) {
+  private connectSSE() {
     if (typeof EventSource === "undefined") return;
     if (this.eventSource && this.eventSource.readyState !== EventSource.CLOSED) {
       return;
     }
 
     try {
-      const sseUrl = `${apiBase}/api/events`;
-      this.eventSource = new EventSource(sseUrl);
+      this.eventSource = new EventSource("/api/events");
 
       this.eventSource.onopen = () => {
         this.setStatus("connected");
@@ -100,39 +80,25 @@ class RealtimeClient {
       };
 
       this.eventSource.onerror = () => {
-        // If SSE fails (e.g. serverless Vercel returns HTML or fails stream), close gracefully to avoid error spam
-        if (this.eventSource) {
-          try {
-            this.eventSource.close();
-          } catch {}
-          this.eventSource = null;
-        }
-        if (this.status !== "connected") {
+        // EventSource will automatically retry connecting natively
+        if (this.status !== "connected" && (!this.ws || this.ws.readyState !== WebSocket.OPEN)) {
           this.setStatus("connecting");
         }
       };
     } catch (err) {
-      // SSE init error
+      console.warn("SSE init error:", err);
     }
   }
 
-  private connectWS(apiBase: string) {
+  private connectWS() {
     if (typeof WebSocket === "undefined") return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
-    let wsUrl = "";
-    if (apiBase.startsWith("https://")) {
-      wsUrl = apiBase.replace("https://", "wss://") + "/api/ws";
-    } else if (apiBase.startsWith("http://")) {
-      wsUrl = apiBase.replace("http://", "ws://") + "/api/ws";
-    } else if (typeof window !== "undefined") {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      wsUrl = `${protocol}//${window.location.host}/api/ws`;
-    }
-
-    if (!wsUrl) return;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const host = window.location.host;
+    const wsUrl = `${protocol}//${host}/api/ws`;
 
     try {
       this.ws = new WebSocket(wsUrl);
@@ -153,21 +119,23 @@ class RealtimeClient {
 
       this.ws.onclose = () => {
         this.stopHeartbeat();
+        // If SSE is open, we are still connected!
         if (!this.eventSource || this.eventSource.readyState !== EventSource.OPEN) {
           this.setStatus("connecting");
         }
+        this.scheduleReconnect();
       };
 
       this.ws.onerror = () => {
+        // Silently close without throwing unhandled rejection
         if (this.ws) {
           try {
             this.ws.close();
           } catch {}
-          this.ws = null;
         }
       };
     } catch {
-      // WS failed, background polling handles sync
+      // WS failed, SSE will handle real-time sync
     }
   }
 
@@ -226,17 +194,12 @@ class RealtimeClient {
 
   private startBackgroundSync() {
     if (this.pollingInterval) return;
-    // Periodic silent sync:
-    // - Every 2 seconds on Vercel serverless (aggressive real-time) to catch cross-tab updates from MongoDB Atlas
-    // - Every 12 seconds fallback on long-lived connections if disconnected
-    const intervalMs = this.isServerless ? 2000 : 12000;
+    // Periodic silent sync every 12 seconds ONLY if connection dropped completely (fallback)
     this.pollingInterval = setInterval(() => {
-      if (typeof document !== "undefined" && document.visibilityState === "visible") {
-        if (this.isServerless || this.status !== "connected") {
-          this.notifyListeners({ type: "sync:refresh", payload: { reason: "periodic" } });
-        }
+      if (document.visibilityState === "visible" && this.status !== "connected") {
+        this.notifyListeners({ type: "sync:refresh", payload: { reason: "periodic" } });
       }
-    }, intervalMs);
+    }, 12000);
   }
 
   private scheduleReconnect() {
@@ -275,105 +238,4 @@ class RealtimeClient {
 
 export const wsClient = new RealtimeClient();
 export const realtimeClient = wsClient;
-
-/**
- * useWebSocketSync
- * Listens to live WebSocket/SSE events and merges updates directly into
- * the React Query cache (e.g. invoiceDetail, notes, status, lists, metrics)
- * without requiring a full page refresh.
- */
-export function useWebSocketSync() {
-  const queryClient = useQueryClient();
-
-  useEffect(() => {
-    const unsubscribe = wsClient.subscribe((event) => {
-      const { type, payload } = event;
-      if (!payload) return;
-
-      const noInvoice = payload.no_invoice || payload.invoice || payload.id;
-
-      switch (type) {
-        case "invoice:status":
-        case "order:status": {
-          const newStatus = payload.status;
-          if (noInvoice && newStatus) {
-            // 1. Live merge into invoice detail in React Query cache
-            queryClient.setQueryData<any>(["invoiceDetail", noInvoice], (prev: any) => {
-              if (!prev || !prev.invoice) return prev;
-              const updatedHistory = payload.history || prev.history || [];
-              return {
-                ...prev,
-                invoice: { ...prev.invoice, status: newStatus },
-                history: updatedHistory,
-                items: (prev.items || []).map((it: any) => ({ ...it, status: newStatus })),
-              };
-            });
-
-            // 2. Invalidate aggregate list and summary queries
-            queryClient.invalidateQueries({ queryKey: ["invoices"] });
-            queryClient.invalidateQueries({ queryKey: ["invoices-summary"] });
-            queryClient.invalidateQueries({ queryKey: ["orders"] });
-            queryClient.invalidateQueries({ queryKey: ["analytics-summary"] });
-          }
-          break;
-        }
-
-        case "invoice:note": {
-          const incomingNote = payload.note;
-          if (noInvoice && incomingNote) {
-            queryClient.setQueryData<any>(["invoiceDetail", noInvoice], (prev: any) => {
-              if (!prev) return prev;
-              const currentNotes = prev.notes || [];
-              const tempIdx = currentNotes.findIndex(
-                (n: any) =>
-                  String(n.id).startsWith("temp-") &&
-                  n.note === incomingNote.note &&
-                  n.author === incomingNote.author
-              );
-              if (tempIdx !== -1) {
-                const updated = [...currentNotes];
-                updated[tempIdx] = incomingNote;
-                return { ...prev, notes: updated };
-              }
-              const exists = currentNotes.some((n: any) => String(n.id) === String(incomingNote.id));
-              if (exists) return prev;
-              return { ...prev, notes: [...currentNotes, incomingNote] };
-            });
-          }
-          break;
-        }
-
-        case "invoice:updated":
-        case "order:updated": {
-          if (noInvoice) {
-            queryClient.invalidateQueries({ queryKey: ["invoiceDetail", noInvoice] });
-            queryClient.invalidateQueries({ queryKey: ["invoices"] });
-            queryClient.invalidateQueries({ queryKey: ["invoices-summary"] });
-            queryClient.invalidateQueries({ queryKey: ["orders"] });
-          }
-          break;
-        }
-
-        case "invoice:created":
-        case "order:created":
-        case "order:imported":
-        case "invoice:deleted":
-        case "order:deleted":
-        case "sync:refresh": {
-          queryClient.invalidateQueries({ queryKey: ["invoices"] });
-          queryClient.invalidateQueries({ queryKey: ["invoices-summary"] });
-          queryClient.invalidateQueries({ queryKey: ["orders"] });
-          queryClient.invalidateQueries({ queryKey: ["analytics-summary"] });
-          break;
-        }
-
-        default:
-          break;
-      }
-    });
-
-    return () => unsubscribe();
-  }, [queryClient]);
-}
-
 
