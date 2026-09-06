@@ -606,20 +606,66 @@ async function getNextOrderStatus(currentStatus: string): Promise<string | null>
   return null;
 }
 
-const apiCache = new Map<string, { data: any; expiry: number }>();
-function getFromCache(keyPrefix: string, url: string): any | null {
-  const item = apiCache.get(`${keyPrefix}:${url}`);
-  if (item && Date.now() < item.expiry) return item.data;
-  return null;
+interface CacheEntry {
+  data: any;
+  expiry: number;
+  sizeBytes: number;
 }
-function setInCache(keyPrefix: string, url: string, data: any, ttlSeconds: number) {
-  apiCache.set(`${keyPrefix}:${url}`, { data, expiry: Date.now() + ttlSeconds * 1000 });
+
+const apiCache = new Map<string, CacheEntry>();
+const MAX_CACHE_MB = 15;
+const MAX_CACHE_BYTES = MAX_CACHE_MB * 1024 * 1024;
+let currentCacheBytes = 0;
+
+function roughSize(object: any): number {
+  try {
+    const str = typeof object === "string" ? object : JSON.stringify(object);
+    return str ? str.length * 2 : 1024;
+  } catch {
+    return 1024;
+  }
+}
+
+function getFromCache(keyPrefix: string, key: string): any | null {
+  const fullKey = `${keyPrefix}:${key}`;
+  const item = apiCache.get(fullKey);
+  if (!item) return null;
+  if (Date.now() > item.expiry) {
+    currentCacheBytes = Math.max(0, currentCacheBytes - item.sizeBytes);
+    apiCache.delete(fullKey);
+    return null;
+  }
+  return item.data;
+}
+
+function setInCache(keyPrefix: string, key: string, data: any, ttlSeconds: number) {
+  const fullKey = `${keyPrefix}:${key}`;
+  const existing = apiCache.get(fullKey);
+  if (existing) {
+    currentCacheBytes = Math.max(0, currentCacheBytes - existing.sizeBytes);
+  }
+  const sizeBytes = roughSize(data);
+
+  // Auto-eviction if cache exceeds MAX_CACHE_MB
+  if (currentCacheBytes + sizeBytes > MAX_CACHE_BYTES) {
+    const now = Date.now();
+    for (const [k, v] of apiCache.entries()) {
+      if (v.expiry < now || currentCacheBytes + sizeBytes > MAX_CACHE_BYTES) {
+        currentCacheBytes = Math.max(0, currentCacheBytes - v.sizeBytes);
+        apiCache.delete(k);
+      }
+    }
+  }
+
+  apiCache.set(fullKey, { data, expiry: Date.now() + ttlSeconds * 1000, sizeBytes });
+  currentCacheBytes += sizeBytes;
 }
 
 let productMapCache: { map: Map<string, string>; expiry: number } | null = null;
 function invalidateOrdersAndAnalyticsCache() {
   productMapCache = null;
   apiCache.clear();
+  currentCacheBytes = 0;
 }
 async function getProductNameMap(): Promise<Map<string, string>> {
   if (productMapCache && Date.now() < productMapCache.expiry) {
@@ -634,9 +680,26 @@ async function getProductNameMap(): Promise<Map<string, string>> {
   return map;
 }
 
-// Helper to flatten orders for frontend with targeted database projection
+// Helper to flatten orders for frontend with targeted database projection (exclude notes, history, heavy customer snapshot)
 async function fetchFlatOrders(query: any) {
-  const docs = await db.collection("sales").find(query).sort({ created_at: -1 }).toArray();
+  const docs = await db.collection("sales").find(query, {
+    projection: {
+      no_invoice: 1,
+      nama_customer: 1,
+      no_telepon: 1,
+      alamat: 1,
+      "customer_snapshot.no_telepon": 1,
+      "customer_snapshot.alamat": 1,
+      channel: 1,
+      status: 1,
+      nama_sales: 1,
+      nama_divisi: 1,
+      created_at: 1,
+      "items.sku": 1,
+      "items.qty": 1,
+      "items.amount": 1,
+    }
+  }).sort({ created_at: -1 }).toArray();
   if (docs.length === 0) return [];
 
   // Extract unique SKUs present in these documents
@@ -714,6 +777,10 @@ function parseWibDateRange(startDateParam?: any, endDateParam?: any) {
 // --- 1. ENDPOINT SUMMARY (Memperbaiki Bug Angka Badge Filter) ---
 app.get("/api/invoices-summary", async (req: Request, res: Response) => {
   try {
+    const cacheKey = req.originalUrl || req.url;
+    const cached = getFromCache("invoices-summary", cacheKey);
+    if (cached) return res.json(cached);
+
     const { startDate, endDate, channel, status } = req.query;
     let filter: any = {};
 
@@ -755,7 +822,9 @@ app.get("/api/invoices-summary", async (req: Request, res: Response) => {
       if (c._id) channelCounts[c._id] = c.count;
     }
 
-    res.json({ total: totalCount, statusCounts, channelCounts });
+    const result = { total: totalCount, statusCounts, channelCounts };
+    setInCache("invoices-summary", cacheKey, result, 120); // 2 min cache
+    res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -844,6 +913,25 @@ app.get("/api/invoices", async (req: Request, res: Response) => {
     }
     fallbackPipeline.push({ $sort: { created_at: -1, _id: -1 } });
     fallbackPipeline.push({ $limit: limitNum + 1 });
+    fallbackPipeline.push({
+      $project: {
+        no_invoice: 1,
+        nama_customer: 1,
+        no_telepon: 1,
+        alamat: 1,
+        "customer_snapshot.no_telepon": 1,
+        "customer_snapshot.alamat": 1,
+        channel: 1,
+        status: 1,
+        nama_sales: 1,
+        nama_divisi: 1,
+        created_at: 1,
+        "items.sku": 1,
+        "items.item_name": 1,
+        "items.qty": 1,
+        "items.amount": 1,
+      }
+    });
 
     const docs = await db.collection("sales").aggregate(fallbackPipeline).toArray();
 
@@ -1211,6 +1299,7 @@ app.post("/api/orders/:id/advance", async (req: Request, res: Response) => {
     });
     
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status: nextStatus, history } });
+    invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "order:status", payload: { id: rawId, status: nextStatus, oldStatus: doc.status } });
     res.json({ ok: true, status: nextStatus });
   } catch (err: any) { 
@@ -1291,6 +1380,10 @@ app.delete("/api/orders/:id", async (req: Request, res: Response) => {
 
 app.get("/api/analytics/summary", async (req: Request, res: Response) => {
   try {
+    const cacheKey = req.originalUrl || req.url;
+    const cached = getFromCache("analytics-summary", cacheKey);
+    if (cached) return res.json(cached);
+
     const range = (req.query.range as string) || "this_month";
 
     // Use Jakarta (WIB / UTC+7) date formatting for accurate local business reporting
@@ -1603,6 +1696,7 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
       daily_sales,
     };
 
+    setInCache("analytics-summary", cacheKey, summaryData, 120); // 2 min cache
     res.json(summaryData);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });

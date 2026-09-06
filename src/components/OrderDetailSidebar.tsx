@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   X,
@@ -6,32 +6,41 @@ import {
   User,
   ShoppingBag,
   Building2,
-  Calendar,
   Layers,
   Send,
   MessageSquare,
   CheckCircle2,
   AlertCircle,
   Package,
-  Truck,
   ArrowRight,
   Trash2,
   Copy,
   Check,
-  Printer,
-  ChevronRight,
   RotateCcw,
   Edit3,
   Phone,
   MapPin,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
-import { InvoiceOrder, InvoiceDetailResponse, OrderStatus, SalesChannel, Channel, OrderStatusMaster, OrderNote } from "../types";
+import {
+  InvoiceOrder,
+  InvoiceDetailResponse,
+  OrderStatus,
+  SalesChannel,
+  Channel,
+  OrderStatusMaster,
+  OrderNote,
+  SalesPerson,
+  Product,
+  Brand,
+  Customer,
+} from "../types";
 import { api, formatRupiah, formatDate, parseDateToTimestamp } from "../lib/api";
 import { wsClient } from "../lib/ws";
 import { getChannelColor, getStatusColor, getDynamicBadgeStyle } from "../lib/colorUtils";
 import { ConfirmModal } from "./ConfirmModal";
 import { InputOrderForm } from "./InputOrderForm";
-import { SalesPerson, Product, Brand, Customer } from "../types";
 
 interface OrderDetailSidebarProps {
   invoiceNumber: string | null;
@@ -46,6 +55,17 @@ interface OrderDetailSidebarProps {
   products?: Product[];
   brands?: Brand[];
   customers?: Customer[];
+}
+
+interface TimelineEvent {
+  type: "create" | "status" | "note";
+  id: string;
+  timestamp: string;
+  title: string;
+  description?: string;
+  author?: string;
+  icon: any;
+  color: string;
 }
 
 const STATUS_CONFIG: Record<
@@ -89,15 +109,602 @@ const STATUS_CONFIG: Record<
   },
 };
 
-const CHANNEL_BADGES: Record<SalesChannel, string> = {
-  Tokopedia: "bg-emerald-50 text-emerald-700 border-emerald-200",
-  TikTok: "bg-zinc-900 text-white border-zinc-900",
-  Shopee: "bg-orange-50 text-orange-700 border-orange-200",
-  Lazada: "bg-indigo-50 text-indigo-700 border-indigo-200",
-  Offline: "bg-slate-100 text-slate-700 border-slate-300",
-};
+// 1. Memoized Backdrop Component to isolate paint operations
+const Backdrop = React.memo<{ onClick: () => void }>(({ onClick }) => (
+  <div
+    className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs transition-opacity duration-300"
+    onClick={onClick}
+  />
+));
+Backdrop.displayName = "Backdrop";
 
-export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
+// 2. Memoized Status Selector Component
+interface StatusSelectorProps {
+  currentStatus: OrderStatus;
+  createdAt?: string;
+  orderStatuses?: OrderStatusMaster[];
+  statusColorMap: Map<string, { hex: string; badgeStyle: { backgroundColor: string; color: string; borderColor: string } }>;
+  updatingStatus: boolean;
+  onUpdateStatus: (status: OrderStatus) => void;
+  onAdvanceStatus: () => void;
+  nextTarget: string | null;
+}
+
+const StatusSelectorSection = React.memo<StatusSelectorProps>(({
+  currentStatus,
+  createdAt,
+  orderStatuses,
+  statusColorMap,
+  updatingStatus,
+  onUpdateStatus,
+  onAdvanceStatus,
+  nextTarget,
+}) => {
+  const sortedStatuses = useMemo(() => {
+    if (!orderStatuses || orderStatuses.length === 0) return [];
+    return [...orderStatuses].sort((a, b) => (a.urutan || 99) - (b.urutan || 99));
+  }, [orderStatuses]);
+
+  return (
+    <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-xs space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+          Status Nota Saat Ini
+        </span>
+        <span className="text-xs text-slate-400">
+          {createdAt ? formatDate(createdAt) : ""}
+        </span>
+      </div>
+
+      {/* Status Stepper / Selector */}
+      <div className="space-y-2">
+        {sortedStatuses.length > 0 ? (
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {sortedStatuses.map((st, idx) => {
+              const isCurrent = currentStatus === st.nama_status;
+              const colorInfo = statusColorMap.get(st.nama_status) || {
+                hex: "#3b82f6",
+                badgeStyle: { backgroundColor: "#eff6ff", color: "#1e40af", borderColor: "#bfdbfe" },
+              };
+
+              return (
+                <button
+                  key={st.id || st.nama_status}
+                  type="button"
+                  onClick={() => !isCurrent && onUpdateStatus(st.nama_status as OrderStatus)}
+                  disabled={updatingStatus || isCurrent}
+                  title={isCurrent ? `Posisi Status Saat Ini: ${st.nama_status}` : `Ubah status ke ${st.nama_status}`}
+                  className={`relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
+                    isCurrent
+                      ? "ring-2 shadow-xs cursor-default font-bold"
+                      : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 cursor-pointer"
+                  }`}
+                  style={
+                    isCurrent
+                      ? {
+                          backgroundColor: colorInfo.badgeStyle.backgroundColor,
+                          borderColor: colorInfo.hex,
+                          color: colorInfo.badgeStyle.color,
+                        }
+                      : undefined
+                  }
+                >
+                  <div className="flex items-center gap-1.5 w-full">
+                    <span
+                      className="w-5 h-5 rounded-full text-xs font-bold flex items-center justify-center shrink-0"
+                      style={
+                        isCurrent
+                          ? { backgroundColor: colorInfo.hex, color: "#ffffff" }
+                          : { backgroundColor: "#e2e8f0", color: "#475569" }
+                      }
+                    >
+                      {isCurrent ? (
+                        <Check className="w-3.5 h-3.5 stroke-[3]" />
+                      ) : (
+                        st.urutan || idx + 1
+                      )}
+                    </span>
+                    <span className="text-xs truncate">
+                      {st.nama_status}
+                    </span>
+                  </div>
+                  {isCurrent && (
+                    <div
+                      className="mt-1.5 flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded"
+                      style={{
+                        backgroundColor: "rgba(255,255,255,0.7)",
+                        color: colorInfo.hex,
+                      }}
+                    >
+                      <span
+                        className="w-1.5 h-1.5 rounded-full animate-pulse"
+                        style={{ backgroundColor: colorInfo.hex }}
+                      />
+                      <span>Posisi Saat Ini</span>
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-3 gap-2">
+              {(["Input Orderan", "Diproses", "Selesai Packing"] as OrderStatus[]).map((st, idx) => {
+                const isCurrent = currentStatus === st;
+                const isPast =
+                  (currentStatus === "Diproses" && st === "Input Orderan") ||
+                  (currentStatus === "Selesai Packing" && (st === "Input Orderan" || st === "Diproses"));
+
+                return (
+                  <button
+                    key={st}
+                    type="button"
+                    onClick={() => !isCurrent && onUpdateStatus(st)}
+                    disabled={updatingStatus || isCurrent}
+                    title={isCurrent ? `Posisi Status Saat Ini: ${st}` : `Ubah status ke ${st}`}
+                    className={`relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
+                      isCurrent
+                        ? "bg-indigo-50/90 border-indigo-500 ring-2 ring-indigo-500/25 cursor-default shadow-xs"
+                        : isPast
+                        ? "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100 cursor-pointer"
+                        : "bg-white border-slate-200 text-slate-400 hover:border-slate-300 hover:text-slate-700 cursor-pointer"
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 w-full">
+                      <span
+                        className={`w-5 h-5 rounded-full text-xs font-bold flex items-center justify-center shrink-0 ${
+                          isCurrent
+                            ? "bg-indigo-600 text-white shadow-xs"
+                            : isPast
+                            ? "bg-emerald-600 text-white"
+                            : "bg-slate-200 text-slate-600"
+                        }`}
+                      >
+                        {isCurrent ? (
+                          <Check className="w-3.5 h-3.5 stroke-[3]" />
+                        ) : isPast ? (
+                          "✓"
+                        ) : (
+                          idx + 1
+                        )}
+                      </span>
+                      <span className={`text-xs font-semibold truncate ${isCurrent ? "text-indigo-950 font-bold" : ""}`}>
+                        {st}
+                      </span>
+                    </div>
+                    {isCurrent && (
+                      <div className="mt-1.5 flex items-center gap-1 text-[10px] font-bold text-indigo-700 bg-indigo-100/90 px-1.5 py-0.5 rounded">
+                        <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-pulse" />
+                        <span>Posisi Saat Ini</span>
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Batal & Retur Fast Buttons */}
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => currentStatus !== "Batal" && onUpdateStatus("Batal")}
+                disabled={updatingStatus || currentStatus === "Batal"}
+                title={currentStatus === "Batal" ? "Posisi status saat ini: Batal" : "Tandai pesanan Batal"}
+                className={`p-2 rounded-lg border text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+                  currentStatus === "Batal"
+                    ? "bg-rose-100 border-rose-500 text-rose-950 ring-2 ring-rose-400/30 cursor-default shadow-xs"
+                    : "bg-white hover:bg-rose-50/80 border-rose-200 text-rose-700 cursor-pointer"
+                }`}
+              >
+                {currentStatus === "Batal" ? (
+                  <Check className="w-3.5 h-3.5 text-rose-700 stroke-[3]" />
+                ) : (
+                  <X className="w-3.5 h-3.5" />
+                )}
+                <span>{currentStatus === "Batal" ? "Batal (Posisi Saat Ini)" : "Tandai Batal"}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => currentStatus !== "Retur" && onUpdateStatus("Retur")}
+                disabled={updatingStatus || currentStatus === "Retur"}
+                title={currentStatus === "Retur" ? "Posisi status saat ini: Retur" : "Tandai pesanan Retur"}
+                className={`p-2 rounded-lg border text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+                  currentStatus === "Retur"
+                    ? "bg-purple-100 border-purple-500 text-purple-950 ring-2 ring-purple-400/30 cursor-default shadow-xs"
+                    : "bg-white hover:bg-purple-50/80 border-purple-200 text-purple-700 cursor-pointer"
+                }`}
+              >
+                {currentStatus === "Retur" ? (
+                  <Check className="w-3.5 h-3.5 text-purple-700 stroke-[3]" />
+                ) : (
+                  <RotateCcw className="w-3.5 h-3.5" />
+                )}
+                <span>{currentStatus === "Retur" ? "Retur (Posisi Saat Ini)" : "Tandai Retur"}</span>
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Advance Button */}
+      {nextTarget && (
+        <div className="pt-1">
+          <button
+            onClick={onAdvanceStatus}
+            disabled={updatingStatus}
+            className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 shadow-xs transition-colors"
+          >
+            <ArrowRight className="w-4 h-4" />
+            <span>Lanjutkan ke: {nextTarget}</span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+});
+StatusSelectorSection.displayName = "StatusSelectorSection";
+
+// 3. Memoized Transaction Information Component
+interface InfoSectionProps {
+  invoice: InvoiceOrder;
+  channelColorMap: Map<string, { hex: string; badgeStyle: { backgroundColor: string; color: string; borderColor: string } }>;
+  onStartEdit: () => void;
+}
+
+const TransactionInfoSection = React.memo<InfoSectionProps>(({
+  invoice,
+  channelColorMap,
+  onStartEdit,
+}) => {
+  const channelInfo = channelColorMap.get(invoice.channel) || {
+    hex: "#64748b",
+    badgeStyle: { backgroundColor: "#f1f5f9", color: "#334155", borderColor: "#cbd5e1" },
+  };
+
+  return (
+    <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-xs relative">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">
+          Informasi Transaksi
+        </h3>
+        <button
+          onClick={onStartEdit}
+          className="text-slate-400 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50 p-1.5 rounded-lg transition-colors flex items-center gap-1.5"
+          title="Edit Data Nota"
+        >
+          <Edit3 className="w-3.5 h-3.5" />
+          <span className="text-[10px] font-bold">Edit Nota</span>
+        </button>
+      </div>
+      <div className="grid grid-cols-2 gap-4 text-xs">
+        <div>
+          <span className="text-slate-400 block mb-0.5">Nama Customer</span>
+          <span className="font-semibold text-slate-800 flex items-center gap-1.5 text-sm">
+            <User className="w-4 h-4 text-slate-400" />
+            {invoice.nama_customer}
+          </span>
+        </div>
+
+        <div>
+          <span className="text-slate-400 block mb-0.5">Channel Penjualan</span>
+          <span
+            className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-bold border"
+            style={{
+              backgroundColor: channelInfo.badgeStyle.backgroundColor,
+              color: channelInfo.badgeStyle.color,
+              borderColor: channelInfo.badgeStyle.borderColor,
+            }}
+          >
+            {invoice.channel}
+          </span>
+        </div>
+
+        <div>
+          <span className="text-slate-400 block mb-0.5">Sales Person (Snapshot)</span>
+          <span className="font-medium text-slate-800">
+            {invoice.nama_sales}
+          </span>
+        </div>
+
+        <div>
+          <span className="text-slate-400 block mb-0.5">Divisi (Snapshot)</span>
+          <span className="font-medium text-slate-800 flex items-center gap-1">
+            <Building2 className="w-3.5 h-3.5 text-slate-400" />
+            {invoice.nama_divisi}
+          </span>
+        </div>
+
+        <div>
+          <span className="text-slate-400 block mb-0.5">No. Telepon</span>
+          <span className="font-medium text-slate-800 flex items-center gap-1">
+            <Phone className="w-3.5 h-3.5 text-slate-400" />
+            {invoice.no_telepon || (invoice as any).customer_snapshot?.no_telepon || "-"}
+          </span>
+        </div>
+
+        <div className="col-span-2 sm:col-span-1">
+          <span className="text-slate-400 block mb-0.5">Alamat</span>
+          <span className="font-medium text-slate-800 flex items-start gap-1">
+            <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0 mt-0.5" />
+            <span className="break-words">{invoice.alamat || (invoice as any).customer_snapshot?.alamat || "-"}</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+});
+TransactionInfoSection.displayName = "TransactionInfoSection";
+
+// 4. Memoized Items Breakdown Component with Pagination Chunking (Fix Bottleneck #5)
+interface ItemsBreakdownProps {
+  items: any[];
+  itemCount: number;
+  totalQty: number;
+  totalAmount: number;
+}
+
+const ItemsBreakdownSection = React.memo<ItemsBreakdownProps>(({
+  items,
+  itemCount,
+  totalQty,
+  totalAmount,
+}) => {
+  const [showAllItems, setShowAllItems] = useState(false);
+  const CHUNK_SIZE = 15;
+  const displayedItems = useMemo(() => {
+    if (showAllItems || items.length <= CHUNK_SIZE) {
+      return items;
+    }
+    return items.slice(0, CHUNK_SIZE);
+  }, [items, showAllItems]);
+
+  const hasMore = items.length > CHUNK_SIZE && !showAllItems;
+
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
+      <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Layers className="w-4 h-4 text-indigo-600" />
+          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
+            Daftar Produk ({itemCount} Item / {totalQty} Pcs)
+          </h3>
+        </div>
+        <span className="text-xs font-bold text-slate-900">
+          Total: {formatRupiah(totalAmount)}
+        </span>
+      </div>
+
+      <div className="divide-y divide-slate-100">
+        {displayedItems.map((item, idx) => (
+          <div key={item.id || idx} className="p-3.5 hover:bg-slate-50/70 transition-colors flex items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <span className="w-6 h-6 rounded-md bg-slate-100 text-slate-600 text-xs font-bold flex items-center justify-center flex-shrink-0 mt-0.5">
+                {idx + 1}
+              </span>
+              <div>
+                <p className="text-xs font-bold text-slate-900 leading-snug">
+                  {item.item_name}
+                </p>
+                <div className="flex flex-wrap items-center gap-1.5 mt-1 text-[11px]">
+                  <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 font-mono font-medium">
+                    {item.sku}
+                  </span>
+                  {item.nama_brand && item.nama_brand !== "-" && (
+                    <span className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-medium">
+                      {item.nama_brand}
+                    </span>
+                  )}
+                  {item.category && item.category !== "-" && (
+                    <span className="text-slate-400">
+                      • {item.category}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="text-right flex-shrink-0">
+              <span className="text-xs font-bold text-slate-900 block">
+                {formatRupiah(item.amount)}
+              </span>
+              <span className="text-[11px] text-slate-500">
+                Qty: <strong className="text-slate-700">{item.qty}</strong>
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Chunking / Load More Toggle */}
+      {hasMore && (
+        <div className="p-2.5 bg-slate-50/80 border-t border-slate-100 text-center">
+          <button
+            type="button"
+            onClick={() => setShowAllItems(true)}
+            className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors inline-flex items-center gap-1"
+          >
+            <ChevronDown className="w-3.5 h-3.5" />
+            Tampilkan {items.length - CHUNK_SIZE} produk lainnya ({items.length} total)
+          </button>
+        </div>
+      )}
+
+      {showAllItems && items.length > CHUNK_SIZE && (
+        <div className="p-2 bg-slate-50/50 border-t border-slate-100 text-center">
+          <button
+            type="button"
+            onClick={() => setShowAllItems(false)}
+            className="text-[11px] font-medium text-slate-500 hover:text-slate-800 transition-colors inline-flex items-center gap-1"
+          >
+            <ChevronUp className="w-3.5 h-3.5" />
+            Ciutkan daftar produk
+          </button>
+        </div>
+      )}
+
+      {/* Items Footer Total */}
+      <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs">
+        <span className="text-slate-500 font-medium">
+          Subtotal ({totalQty} unit produk)
+        </span>
+        <span className="text-sm font-bold text-indigo-700">
+          {formatRupiah(totalAmount)}
+        </span>
+      </div>
+    </div>
+  );
+});
+ItemsBreakdownSection.displayName = "ItemsBreakdownSection";
+
+// 5. Memoized Timeline Section with Chunking & Fast Virtualized Rendering (Fix Bottlenecks #1, #2)
+interface TimelineSectionProps {
+  events: TimelineEvent[];
+  newNote: string;
+  noteAuthor: string;
+  isAddingNote: boolean;
+  onNewNoteChange: (val: string) => void;
+  onNoteAuthorChange: (val: string) => void;
+  onAddNote: (e: React.FormEvent) => void;
+}
+
+const TimelineSection = React.memo<TimelineSectionProps>(({
+  events,
+  newNote,
+  noteAuthor,
+  isAddingNote,
+  onNewNoteChange,
+  onNoteAuthorChange,
+  onAddNote,
+}) => {
+  const [showAllEvents, setShowAllEvents] = useState(false);
+  const MAX_EVENTS = 25;
+
+  const displayedEvents = useMemo(() => {
+    if (showAllEvents || events.length <= MAX_EVENTS) {
+      return events;
+    }
+    // Show the first 25 events (oldest to recent or newest)
+    return events.slice(0, MAX_EVENTS);
+  }, [events, showAllEvents]);
+
+  const hasMoreEvents = events.length > MAX_EVENTS && !showAllEvents;
+
+  return (
+    <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-xs space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Clock className="w-4 h-4 text-indigo-600" />
+          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
+            Timeline & Riwayat Pesanan ({events.length})
+          </h3>
+        </div>
+      </div>
+
+      {/* Chronological Timeline Stream */}
+      <div className="relative pl-6 space-y-4 before:absolute before:left-2.5 before:top-2 before:bottom-2 before:w-0.5 before:bg-slate-200">
+        {displayedEvents.map((evt) => {
+          const IconComponent = evt.icon;
+          return (
+            <div key={evt.id} className="relative group">
+              {/* Dot / Icon */}
+              <div
+                className={`absolute -left-6 top-0.5 w-5 h-5 rounded-full border flex items-center justify-center text-[10px] ${
+                  !evt.color.startsWith("#") ? evt.color : ""
+                }`}
+                style={
+                  evt.color.startsWith("#")
+                    ? { backgroundColor: evt.color, borderColor: evt.color, color: "#ffffff" }
+                    : undefined
+                }
+              >
+                <IconComponent className="w-3 h-3" />
+              </div>
+
+              <div className="bg-slate-50/80 rounded-lg p-2.5 border border-slate-200/80">
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-xs font-bold text-slate-800">
+                    {evt.title}
+                  </span>
+                  <span className="text-[10px] text-slate-400 whitespace-nowrap">
+                    {formatDate(evt.timestamp)}
+                  </span>
+                </div>
+                {evt.description && (
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    {evt.description}
+                  </p>
+                )}
+                {evt.author && (
+                  <span className="inline-block mt-1 text-[10px] font-medium text-slate-400">
+                    Oleh: {evt.author}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {hasMoreEvents && (
+        <div className="text-center pt-1">
+          <button
+            type="button"
+            onClick={() => setShowAllEvents(true)}
+            className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors inline-flex items-center gap-1"
+          >
+            <ChevronDown className="w-3.5 h-3.5" />
+            Tampilkan Seluruh Timeline ({events.length} Peristiwa)
+          </button>
+        </div>
+      )}
+
+      {/* Add Note Form */}
+      <form onSubmit={onAddNote} className="pt-2 border-t border-slate-100 space-y-2">
+        <div className="flex items-center justify-between">
+          <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+            <MessageSquare className="w-3.5 h-3.5 text-slate-400" />
+            Tambah Catatan Internal / Gudang
+          </label>
+          <select
+            value={noteAuthor}
+            onChange={(e) => onNoteAuthorChange(e.target.value)}
+            className="text-[11px] bg-slate-50 border border-slate-200 rounded px-2 py-0.5 text-slate-600 focus:outline-none"
+          >
+            <option value="Admin">Sebagai: Admin</option>
+            <option value="Gudang">Sebagai: Gudang</option>
+            <option value="Sales">Sebagai: Sales</option>
+            <option value="Kurir">Sebagai: Kurir / Ekspedisi</option>
+          </select>
+        </div>
+
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={newNote}
+            disabled={isAddingNote}
+            onChange={(e) => onNewNoteChange(e.target.value)}
+            placeholder="Tulis catatan (misal: Packing kayu, resi kurir, catatan pembeli)..."
+            className="flex-1 text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:bg-white transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          />
+          <button
+            type="submit"
+            disabled={isAddingNote || !newNote.trim()}
+            className="px-3 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <Send className="w-3.5 h-3.5" />
+            Simpan
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+});
+TimelineSection.displayName = "TimelineSection";
+
+// Main OrderDetailSidebar Component
+const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
   invoiceNumber,
   isOpen,
   onClose,
@@ -142,9 +749,44 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
       return await api.getInvoiceDetail(invoiceNumber);
     },
     enabled: !!isOpen && !!invoiceNumber,
+    staleTime: 1000 * 60 * 5, // 5 mins cache to avoid unnecessary network hops
   });
 
   const error = queryErr ? (queryErr as Error).message || "Gagal memuat detail pesanan." : null;
+
+  const invoice = data?.invoice;
+  const items = data?.items || [];
+  const history = data?.history || [];
+  const notes = data?.notes || [];
+
+  // Fix Bottleneck #4: Memoize color mappings to eliminate inline render loops
+  const statusColorMap = useMemo(() => {
+    const map = new Map<string, { hex: string; badgeStyle: { backgroundColor: string; color: string; borderColor: string } }>();
+    if (orderStatuses) {
+      orderStatuses.forEach((st) => {
+        const hex = getStatusColor(st.nama_status, orderStatuses);
+        map.set(st.nama_status, {
+          hex,
+          badgeStyle: getDynamicBadgeStyle(hex),
+        });
+      });
+    }
+    return map;
+  }, [orderStatuses]);
+
+  const channelColorMap = useMemo(() => {
+    const map = new Map<string, { hex: string; badgeStyle: { backgroundColor: string; color: string; borderColor: string } }>();
+    if (channels) {
+      channels.forEach((ch) => {
+        const hex = getChannelColor(ch.nama_channel, channels);
+        map.set(ch.nama_channel, {
+          hex,
+          badgeStyle: getDynamicBadgeStyle(hex),
+        });
+      });
+    }
+    return map;
+  }, [channels]);
 
   // 2. Realtime WebSocket listener to sync notes or updates live
   useEffect(() => {
@@ -172,7 +814,7 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
     return () => unsubscribe();
   }, [isOpen, invoiceNumber, queryClient]);
 
-  // 3. React Query Mutation for Notes with 0ms Optimistic Update
+  // Fix Bottleneck #3: No Query Invalidation on Every Status/Note Change - Update queryClient with setQueryData directly
   const addNoteMutation = useMutation({
     mutationFn: async ({ noInvoice, note, author }: { noInvoice: string; note: string; author?: string }) => {
       return await api.addInvoiceNote(noInvoice, note, author);
@@ -198,18 +840,36 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
 
       return { previousDetail };
     },
+    onSuccess: (savedNote: any, { noInvoice }) => {
+      if (savedNote) {
+        queryClient.setQueryData<InvoiceDetailResponse>(["invoiceDetail", noInvoice], (prev) => {
+          if (!prev) return prev;
+          const currentNotes = prev.notes || [];
+          const tempIdx = currentNotes.findIndex(
+            (n) => String(n.id).startsWith("temp-") && n.note === savedNote.note
+          );
+          if (tempIdx !== -1) {
+            const updated = [...currentNotes];
+            updated[tempIdx] = savedNote;
+            return { ...prev, notes: updated };
+          }
+          if (!currentNotes.some((n) => String(n.id) === String(savedNote.id))) {
+            return { ...prev, notes: [...currentNotes, savedNote] };
+          }
+          return prev;
+        });
+      }
+    },
     onError: (err: any, { noInvoice }, context) => {
       if (context?.previousDetail) {
         queryClient.setQueryData(["invoiceDetail", noInvoice], context.previousDetail);
       }
       alert(`Gagal menambahkan catatan: ${err?.message || err}`);
     },
-    onSettled: (_data, _error, { noInvoice }) => {
-      queryClient.invalidateQueries({ queryKey: ["invoiceDetail", noInvoice] });
-    },
+    // Avoid queryClient.invalidateQueries! Eliminates network jitter, scroll resets, and drawer flicker.
   });
 
-  // 4. React Query Mutations for Status Updates
+  // Status Mutations with setQueryData cache synchronization
   const updateStatusMutation = useMutation({
     mutationFn: async ({ noInvoice, status, author }: { noInvoice: string; status: OrderStatus; author?: string }) => {
       return await api.updateInvoiceStatus(noInvoice, status, author);
@@ -254,8 +914,8 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
       }
       alert(`Gagal memperbarui status: ${err?.message || err}`);
     },
-    onSettled: (_data, _error, { noInvoice }) => {
-      onRefreshData?.(true);
+    onSettled: () => {
+      onRefreshData?.(true); // Silent grid sync without refetching active invoiceDetail
     },
   });
 
@@ -307,34 +967,27 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
       }
       alert(`Gagal memajukan status: ${err?.message || err}`);
     },
-    onSettled: (_data, _error, { noInvoice }) => {
-      onRefreshData?.(true);
+    onSettled: () => {
+      onRefreshData?.(true); // Silent grid sync
     },
   });
 
   const updatingStatus = updateStatusMutation.isPending || advanceStatusMutation.isPending;
 
-  if (!isOpen) return null;
-
-  const invoice = data?.invoice;
-  const items = data?.items || [];
-  const history = data?.history || [];
-  const notes = data?.notes || [];
-
-  const handleUpdateStatus = (newStatus: OrderStatus) => {
+  const handleUpdateStatus = useCallback((newStatus: OrderStatus) => {
     const targetInvoice = invoice?.no_invoice || invoiceNumber;
     if (!targetInvoice || updateStatusMutation.isPending) return;
     if (invoice?.status === newStatus) return;
     updateStatusMutation.mutate({ noInvoice: targetInvoice, status: newStatus, author: userRole });
-  };
+  }, [invoice?.no_invoice, invoice?.status, invoiceNumber, updateStatusMutation, userRole]);
 
-  const handleAdvanceStatus = () => {
+  const handleAdvanceStatus = useCallback(() => {
     const targetInvoice = invoice?.no_invoice || invoiceNumber;
     if (!targetInvoice || advanceStatusMutation.isPending) return;
     advanceStatusMutation.mutate({ noInvoice: targetInvoice, author: userRole });
-  };
+  }, [invoice?.no_invoice, invoiceNumber, advanceStatusMutation, userRole]);
 
-  const handleAddNote = (e: React.FormEvent) => {
+  const handleAddNote = useCallback((e: React.FormEvent) => {
     e.preventDefault();
     const noteText = newNote.trim();
     const targetInvoice = invoice?.no_invoice || invoiceNumber;
@@ -348,9 +1001,9 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
       note: noteText,
       author: noteAuthor,
     });
-  };
+  }, [newNote, invoice?.no_invoice, invoiceNumber, addNoteMutation, noteAuthor]);
 
-  const handleCopySummary = () => {
+  const handleCopySummary = useCallback(() => {
     if (!invoice) return;
     const itemsList = items
       .map((it, idx) => `${idx + 1}. ${it.item_name} (${it.sku}) - ${it.qty} pcs @ ${formatRupiah(it.amount)}`)
@@ -370,9 +1023,9 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
     navigator.clipboard.writeText(summary);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  };
+  }, [invoice, items]);
 
-  const handleDeleteInvoice = async () => {
+  const handleDeleteInvoice = useCallback(async () => {
     if (!invoiceNumber) return;
     setIsDeleting(true);
     try {
@@ -385,26 +1038,16 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
     } finally {
       setIsDeleting(false);
     }
-  };
+  }, [invoiceNumber, onClose, onRefreshData]);
 
-  // Compile Unified Timeline:
-  // 1. Order creation event
-  // 2. Status change events
-  // 3. User notes
-  const timelineEvents: {
-    type: "create" | "status" | "note";
-    id: string;
-    timestamp: string;
-    title: string;
-    description?: string;
-    author?: string;
-    icon: any;
-    color: string;
-  }[] = [];
+  // Fix Bottleneck #1: Memoize timeline events compilation and sorting at top-level
+  const timelineEvents = useMemo(() => {
+    if (!invoice) return [];
 
-  if (invoice) {
-    // 1. Creation event
-    timelineEvents.push({
+    const events: TimelineEvent[] = [];
+
+    // 1. Order creation event
+    events.push({
       type: "create",
       id: "event-create",
       timestamp: invoice.created_at,
@@ -415,7 +1058,7 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
       color: "bg-amber-100 text-amber-700 border-amber-300",
     });
 
-    // 2. Status & Edit history
+    // 2. Status change & edit history
     history.forEach((h, idx) => {
       const authorName = h.author
         ? h.author
@@ -431,27 +1074,25 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
         return Clock;
       };
 
-      const getStatusColorCls = (st: string) => {
-        const hex = getStatusColor(st, orderStatuses);
-        return hex;
-      };
+      const colorData = statusColorMap.get(h.status_baru);
+      const hex = colorData?.hex || getStatusColor(h.status_baru, orderStatuses);
 
       const isEditEvent = h.status_lama === "Edit Nota" || h.status_lama?.startsWith("Edit");
 
-      timelineEvents.push({
+      events.push({
         type: "status",
         id: `event-status-${h.id || idx}`,
         timestamp: h.updated_at,
         title: isEditEvent ? `Perubahan Data: ${h.status_baru}` : `Perubahan Status: ${h.status_lama} → ${h.status_baru}`,
         author: authorName,
         icon: isEditEvent ? Edit3 : getStatusIcon(h.status_baru),
-        color: isEditEvent ? "#3b82f6" : getStatusColorCls(h.status_baru),
+        color: isEditEvent ? "#3b82f6" : hex,
       });
     });
 
-    // 3. Notes
+    // 3. User notes
     notes.forEach((n) => {
-      timelineEvents.push({
+      events.push({
         type: "note",
         id: `event-note-${n.id}`,
         timestamp: n.created_at,
@@ -464,22 +1105,31 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
     });
 
     // Sort chronologically (oldest to newest for natural timeline story)
-    timelineEvents.sort((a, b) => {
+    return events.sort((a, b) => {
       const timeA = parseDateToTimestamp(a.timestamp);
       const timeB = parseDateToTimestamp(b.timestamp);
       return timeA - timeB;
     });
-  }
+  }, [invoice, history, notes, userRole, orderStatuses, statusColorMap]);
 
-  const currentStatusConfig = invoice ? STATUS_CONFIG[invoice.status] || STATUS_CONFIG["Input Orderan"] : null;
+  // Compute next target label for status advance button
+  const nextTargetLabel = useMemo(() => {
+    if (!invoice) return null;
+    const currentMaster = orderStatuses?.find((s) => s.nama_status === invoice.status);
+    const canAdvance = orderStatuses && orderStatuses.length > 0
+      ? !currentMaster?.is_final && currentMaster?.next_status
+      : invoice.status !== "Selesai Packing" && invoice.status !== "Batal" && invoice.status !== "Retur";
+
+    if (!canAdvance) return null;
+    return currentMaster?.next_status || STATUS_CONFIG[invoice.status]?.nextLabel || "Lanjutkan Status";
+  }, [invoice, orderStatuses]);
+
+  if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 overflow-hidden">
-      {/* Backdrop */}
-      <div
-        className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs transition-opacity duration-300"
-        onClick={onClose}
-      />
+      {/* Fix Bottleneck #6: Isolated Memoized Backdrop */}
+      <Backdrop onClick={onClose} />
 
       {/* Slide-over Right Drawer */}
       <div className="fixed inset-y-0 right-0 max-w-full flex pl-10">
@@ -499,7 +1149,7 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
                   <button
                     onClick={handleCopySummary}
                     title="Salin Ringkasan Pesanan"
-                    className="p-1 rounded text-slate-400 hover:text-white hover:bg-white/10 transition-colors"
+                    className="p-1 rounded text-slate-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
                   >
                     {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
                   </button>
@@ -513,7 +1163,7 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
             <div className="flex items-center gap-2">
               <button
                 onClick={onClose}
-                className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white flex items-center justify-center transition-colors"
+                className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white flex items-center justify-center transition-colors cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -554,468 +1204,58 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
                   />
                 </div>
               ) : (
-              <>
-                {/* Status Progress & Quick Advance */}
-                <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-xs space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                      Status Nota Saat Ini
-                    </span>
-                    <span className="text-xs text-slate-400">
-                      {invoice.created_at ? formatDate(invoice.created_at) : ""}
-                    </span>
-                  </div>
+                <>
+                  {/* Status Progress & Quick Advance (Memoized Component) */}
+                  <StatusSelectorSection
+                    currentStatus={invoice.status}
+                    createdAt={invoice.created_at}
+                    orderStatuses={orderStatuses}
+                    statusColorMap={statusColorMap}
+                    updatingStatus={updatingStatus}
+                    onUpdateStatus={handleUpdateStatus}
+                    onAdvanceStatus={handleAdvanceStatus}
+                    nextTarget={nextTargetLabel}
+                  />
 
-                  {/* Status Stepper / Selector */}
-                  <div className="space-y-2">
-                    {orderStatuses && orderStatuses.length > 0 ? (
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                        {[...orderStatuses]
-                          .sort((a, b) => (a.urutan || 99) - (b.urutan || 99))
-                          .map((st, idx) => {
-                            const isCurrent = invoice.status === st.nama_status;
-                            const stColor = getStatusColor(st.nama_status, orderStatuses);
-                            const badgeStyle = getDynamicBadgeStyle(stColor);
+                  {/* Transaction Info (Memoized Component) */}
+                  <TransactionInfoSection
+                    invoice={invoice}
+                    channelColorMap={channelColorMap}
+                    onStartEdit={() => setIsEditingMode(true)}
+                  />
 
-                            return (
-                              <button
-                                key={st.id || st.nama_status}
-                                type="button"
-                                onClick={() => !isCurrent && handleUpdateStatus(st.nama_status as OrderStatus)}
-                                disabled={updatingStatus || isCurrent}
-                                title={isCurrent ? `Posisi Status Saat Ini: ${st.nama_status}` : `Ubah status ke ${st.nama_status}`}
-                                className={`relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
-                                  isCurrent
-                                    ? "ring-2 shadow-xs cursor-default font-bold"
-                                    : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 cursor-pointer"
-                                }`}
-                                style={
-                                  isCurrent
-                                    ? {
-                                        backgroundColor: badgeStyle.backgroundColor,
-                                        borderColor: stColor,
-                                        color: badgeStyle.color,
-                                      }
-                                    : undefined
-                                }
-                              >
-                                <div className="flex items-center gap-1.5 w-full">
-                                  <span
-                                    className="w-5 h-5 rounded-full text-xs font-bold flex items-center justify-center shrink-0"
-                                    style={
-                                      isCurrent
-                                        ? { backgroundColor: stColor, color: "#ffffff" }
-                                        : { backgroundColor: "#e2e8f0", color: "#475569" }
-                                    }
-                                  >
-                                    {isCurrent ? (
-                                      <Check className="w-3.5 h-3.5 stroke-[3]" />
-                                    ) : (
-                                      st.urutan || idx + 1
-                                    )}
-                                  </span>
-                                  <span className="text-xs truncate">
-                                    {st.nama_status}
-                                  </span>
-                                </div>
-                                {isCurrent && (
-                                  <div
-                                    className="mt-1.5 flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded"
-                                    style={{
-                                      backgroundColor: "rgba(255,255,255,0.7)",
-                                      color: stColor,
-                                    }}
-                                  >
-                                    <span
-                                      className="w-1.5 h-1.5 rounded-full animate-pulse"
-                                      style={{ backgroundColor: stColor }}
-                                    />
-                                    <span>Posisi Saat Ini</span>
-                                  </div>
-                                )}
-                              </button>
-                            );
-                          })}
-                      </div>
-                    ) : (
-                      <>
-                        <div className="grid grid-cols-3 gap-2">
-                          {(["Input Orderan", "Diproses", "Selesai Packing"] as OrderStatus[]).map((st, idx) => {
-                            const isCurrent = invoice.status === st;
-                            const isPast =
-                              (invoice.status === "Diproses" && st === "Input Orderan") ||
-                              (invoice.status === "Selesai Packing" && (st === "Input Orderan" || st === "Diproses"));
+                  {/* Items Breakdown Table (Memoized Component with Chunking) */}
+                  <ItemsBreakdownSection
+                    items={items}
+                    itemCount={invoice.item_count}
+                    totalQty={invoice.total_qty}
+                    totalAmount={invoice.total_amount}
+                  />
 
-                            return (
-                              <button
-                                key={st}
-                                type="button"
-                                onClick={() => !isCurrent && handleUpdateStatus(st)}
-                                disabled={updatingStatus || isCurrent}
-                                title={isCurrent ? `Posisi Status Saat Ini: ${st}` : `Ubah status ke ${st}`}
-                                className={`relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
-                                  isCurrent
-                                    ? "bg-indigo-50/90 border-indigo-500 ring-2 ring-indigo-500/25 cursor-default shadow-xs"
-                                    : isPast
-                                    ? "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100 cursor-pointer"
-                                    : "bg-white border-slate-200 text-slate-400 hover:border-slate-300 hover:text-slate-700 cursor-pointer"
-                                }`}
-                              >
-                                <div className="flex items-center gap-1.5 w-full">
-                                  <span
-                                    className={`w-5 h-5 rounded-full text-xs font-bold flex items-center justify-center shrink-0 ${
-                                      isCurrent
-                                        ? "bg-indigo-600 text-white shadow-xs"
-                                        : isPast
-                                        ? "bg-emerald-600 text-white"
-                                        : "bg-slate-200 text-slate-600"
-                                    }`}
-                                  >
-                                    {isCurrent ? (
-                                      <Check className="w-3.5 h-3.5 stroke-[3]" />
-                                    ) : isPast ? (
-                                      "✓"
-                                    ) : (
-                                      idx + 1
-                                    )}
-                                  </span>
-                                  <span className={`text-xs font-semibold truncate ${isCurrent ? "text-indigo-950 font-bold" : ""}`}>
-                                    {st}
-                                  </span>
-                                </div>
-                                {isCurrent && (
-                                  <div className="mt-1.5 flex items-center gap-1 text-[10px] font-bold text-indigo-700 bg-indigo-100/90 px-1.5 py-0.5 rounded">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-pulse"></span>
-                                    <span>Posisi Saat Ini</span>
-                                  </div>
-                                )}
-                              </button>
-                            );
-                          })}
-                        </div>
+                  {/* History & Notes Timeline (Memoized Component with Chunking) */}
+                  <TimelineSection
+                    events={timelineEvents}
+                    newNote={newNote}
+                    noteAuthor={noteAuthor}
+                    isAddingNote={addNoteMutation.isPending}
+                    onNewNoteChange={setNewNote}
+                    onNoteAuthorChange={setNoteAuthor}
+                    onAddNote={handleAddNote}
+                  />
 
-                        {/* Batal & Retur Fast Buttons */}
-                        <div className="grid grid-cols-2 gap-2 pt-1">
-                          <button
-                            type="button"
-                            onClick={() => invoice.status !== "Batal" && handleUpdateStatus("Batal")}
-                            disabled={updatingStatus || invoice.status === "Batal"}
-                            title={invoice.status === "Batal" ? "Posisi status saat ini: Batal" : "Tandai pesanan Batal"}
-                            className={`p-2 rounded-lg border text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
-                              invoice.status === "Batal"
-                                ? "bg-rose-100 border-rose-500 text-rose-950 ring-2 ring-rose-400/30 cursor-default shadow-xs"
-                                : "bg-white hover:bg-rose-50/80 border-rose-200 text-rose-700 cursor-pointer"
-                            }`}
-                          >
-                            {invoice.status === "Batal" ? (
-                              <Check className="w-3.5 h-3.5 text-rose-700 stroke-[3]" />
-                            ) : (
-                              <X className="w-3.5 h-3.5" />
-                            )}
-                            <span>{invoice.status === "Batal" ? "Batal (Posisi Saat Ini)" : "Tandai Batal"}</span>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => invoice.status !== "Retur" && handleUpdateStatus("Retur")}
-                            disabled={updatingStatus || invoice.status === "Retur"}
-                            title={invoice.status === "Retur" ? "Posisi status saat ini: Retur" : "Tandai pesanan Retur"}
-                            className={`p-2 rounded-lg border text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
-                              invoice.status === "Retur"
-                                ? "bg-purple-100 border-purple-500 text-purple-950 ring-2 ring-purple-400/30 cursor-default shadow-xs"
-                                : "bg-white hover:bg-purple-50/80 border-purple-200 text-purple-700 cursor-pointer"
-                            }`}
-                          >
-                            {invoice.status === "Retur" ? (
-                              <Check className="w-3.5 h-3.5 text-purple-700 stroke-[3]" />
-                            ) : (
-                              <RotateCcw className="w-3.5 h-3.5" />
-                            )}
-                            <span>{invoice.status === "Retur" ? "Retur (Posisi Saat Ini)" : "Tandai Retur"}</span>
-                          </button>
-                        </div>
-                      </>
-                    )}
-                  </div>
-
-                  {/* Advance Button */}
-                  {(() => {
-                    const currentMaster = orderStatuses?.find((s) => s.nama_status === invoice.status);
-                    const canAdvance = orderStatuses && orderStatuses.length > 0
-                      ? !currentMaster?.is_final && currentMaster?.next_status
-                      : invoice.status !== "Selesai Packing" && invoice.status !== "Batal" && invoice.status !== "Retur";
-
-                    if (!canAdvance) return null;
-
-                    const nextTarget = currentMaster?.next_status || currentStatusConfig?.nextLabel || "Lanjutkan Status";
-
-                    return (
-                      <div className="pt-1">
-                        <button
-                          onClick={handleAdvanceStatus}
-                          disabled={updatingStatus}
-                          className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 shadow-xs transition-colors"
-                        >
-                          <ArrowRight className="w-4 h-4" />
-                          <span>Lanjutkan ke: {nextTarget}</span>
-                        </button>
-                      </div>
-                    );
-                  })()}
-                </div>
-
-                {/* Info Card: Customer, Sales, Channel */}
-                <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-xs relative">
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                      Informasi Transaksi
-                    </h3>
+                  {/* Footer Danger Actions */}
+                  <div className="pt-2 flex items-center justify-between text-xs text-slate-400">
+                    <span>Nota ID: #{invoiceNumber}</span>
                     <button
-                      onClick={() => setIsEditingMode(true)}
-                      className="text-slate-400 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50 p-1.5 rounded-lg transition-colors flex items-center gap-1.5"
-                      title="Edit Data Nota"
+                      type="button"
+                      onClick={() => setIsDeleteModalOpen(true)}
+                      className="text-red-600 hover:text-red-700 hover:bg-red-50 px-2.5 py-1 rounded transition-colors flex items-center gap-1.5 cursor-pointer"
                     >
-                      <Edit3 className="w-3.5 h-3.5" />
-                      <span className="text-[10px] font-bold">Edit Nota</span>
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Hapus Transaksi Nota
                     </button>
                   </div>
-                  <div className="grid grid-cols-2 gap-4 text-xs">
-                    <div>
-                      <span className="text-slate-400 block mb-0.5">Nama Customer</span>
-                      <span className="font-semibold text-slate-800 flex items-center gap-1.5 text-sm">
-                        <User className="w-4 h-4 text-slate-400" />
-                        {invoice.nama_customer}
-                      </span>
-                    </div>
-
-                    <div>
-                      <span className="text-slate-400 block mb-0.5">Channel Penjualan</span>
-                      {(() => {
-                        const hexColor = getChannelColor(invoice.channel, channels);
-                        const badgeStyle = getDynamicBadgeStyle(hexColor);
-                        return (
-                          <span
-                            className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-bold border"
-                            style={{
-                              backgroundColor: badgeStyle.backgroundColor,
-                              color: badgeStyle.color,
-                              borderColor: badgeStyle.borderColor,
-                            }}
-                          >
-                            {invoice.channel}
-                          </span>
-                        );
-                      })()}
-                    </div>
-
-                    <div>
-                      <span className="text-slate-400 block mb-0.5">Sales Person (Snapshot)</span>
-                      <span className="font-medium text-slate-800">
-                        {invoice.nama_sales}
-                      </span>
-                    </div>
-
-                    <div>
-                      <span className="text-slate-400 block mb-0.5">Divisi (Snapshot)</span>
-                      <span className="font-medium text-slate-800 flex items-center gap-1">
-                        <Building2 className="w-3.5 h-3.5 text-slate-400" />
-                        {invoice.nama_divisi}
-                      </span>
-                    </div>
-
-                    <div>
-                      <span className="text-slate-400 block mb-0.5">No. Telepon</span>
-                      <span className="font-medium text-slate-800 flex items-center gap-1">
-                        <Phone className="w-3.5 h-3.5 text-slate-400" />
-                        {invoice.no_telepon || (invoice as any).customer_snapshot?.no_telepon || "-"}
-                      </span>
-                    </div>
-
-                    <div className="col-span-2 sm:col-span-1">
-                      <span className="text-slate-400 block mb-0.5">Alamat</span>
-                      <span className="font-medium text-slate-800 flex items-start gap-1">
-                        <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0 mt-0.5" />
-                        <span className="break-words">{invoice.alamat || (invoice as any).customer_snapshot?.alamat || "-"}</span>
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Items Breakdown Table (1 Nota Multi-Item) */}
-                <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
-                  <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Layers className="w-4 h-4 text-indigo-600" />
-                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
-                        Daftar Produk ({invoice.item_count} Item / {invoice.total_qty} Pcs)
-                      </h3>
-                    </div>
-                    <span className="text-xs font-bold text-slate-900">
-                      Total: {formatRupiah(invoice.total_amount)}
-                    </span>
-                  </div>
-
-                  <div className="divide-y divide-slate-100">
-                    {items.map((item, idx) => (
-                      <div key={item.id || idx} className="p-3.5 hover:bg-slate-50/70 transition-colors flex items-start justify-between gap-3">
-                        <div className="flex items-start gap-3">
-                          <span className="w-6 h-6 rounded-md bg-slate-100 text-slate-600 text-xs font-bold flex items-center justify-center flex-shrink-0 mt-0.5">
-                            {idx + 1}
-                          </span>
-                          <div>
-                            <p className="text-xs font-bold text-slate-900 leading-snug">
-                              {item.item_name}
-                            </p>
-                            <div className="flex flex-wrap items-center gap-1.5 mt-1 text-[11px]">
-                              <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 font-mono font-medium">
-                                {item.sku}
-                              </span>
-                              {item.nama_brand && item.nama_brand !== "-" && (
-                                <span className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-medium">
-                                  {item.nama_brand}
-                                </span>
-                              )}
-                              {item.category && item.category !== "-" && (
-                                <span className="text-slate-400">
-                                  • {item.category}
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="text-right flex-shrink-0">
-                          <span className="text-xs font-bold text-slate-900 block">
-                            {formatRupiah(item.amount)}
-                          </span>
-                          <span className="text-[11px] text-slate-500">
-                            Qty: <strong className="text-slate-700">{item.qty}</strong>
-                          </span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Items Footer Total */}
-                  <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs">
-                    <span className="text-slate-500 font-medium">
-                      Subtotal ({invoice.total_qty} unit produk)
-                    </span>
-                    <span className="text-sm font-bold text-indigo-700">
-                      {formatRupiah(invoice.total_amount)}
-                    </span>
-                  </div>
-                </div>
-
-                {/* History & Notes Timeline */}
-                <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-xs space-y-4">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Clock className="w-4 h-4 text-indigo-600" />
-                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
-                        Timeline & Riwayat Pesanan ({timelineEvents.length})
-                      </h3>
-                    </div>
-                  </div>
-
-                  {/* Chronological Timeline Stream */}
-                  <div className="relative pl-6 space-y-4 before:absolute before:left-2.5 before:top-2 before:bottom-2 before:w-0.5 before:bg-slate-200">
-                    {timelineEvents.map((evt) => {
-                      const IconComponent = evt.icon;
-                      return (
-                        <div key={evt.id} className="relative group">
-                          {/* Dot / Icon */}
-                          <div
-                            className={`absolute -left-6 top-0.5 w-5 h-5 rounded-full border flex items-center justify-center text-[10px] ${
-                              !evt.color.startsWith("#") ? evt.color : ""
-                            }`}
-                            style={
-                              evt.color.startsWith("#")
-                                ? { backgroundColor: evt.color, borderColor: evt.color, color: "#ffffff" }
-                                : undefined
-                            }
-                          >
-                            <IconComponent className="w-3 h-3" />
-                          </div>
-
-                          <div className="bg-slate-50/80 rounded-lg p-2.5 border border-slate-200/80">
-                            <div className="flex items-center justify-between gap-2 mb-1">
-                              <span className="text-xs font-bold text-slate-800">
-                                {evt.title}
-                              </span>
-                              <span className="text-[10px] text-slate-400 whitespace-nowrap">
-                                {formatDate(evt.timestamp)}
-                              </span>
-                            </div>
-                            {evt.description && (
-                              <p className="text-xs text-slate-600 leading-relaxed">
-                                {evt.description}
-                              </p>
-                            )}
-                            {evt.author && (
-                              <span className="inline-block mt-1 text-[10px] font-medium text-slate-400">
-                                Oleh: {evt.author}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {/* Add Note Form */}
-                  <form onSubmit={handleAddNote} className="pt-2 border-t border-slate-100 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
-                        <MessageSquare className="w-3.5 h-3.5 text-slate-400" />
-                        Tambah Catatan Internal / Gudang
-                      </label>
-                      <select
-                        value={noteAuthor}
-                        onChange={(e) => setNoteAuthor(e.target.value)}
-                        className="text-[11px] bg-slate-50 border border-slate-200 rounded px-2 py-0.5 text-slate-600 focus:outline-none"
-                      >
-                        <option value="Admin">Sebagai: Admin</option>
-                        <option value="Gudang">Sebagai: Gudang</option>
-                        <option value="Sales">Sebagai: Sales</option>
-                        <option value="Kurir">Sebagai: Kurir / Ekspedisi</option>
-                      </select>
-                    </div>
-
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={newNote}
-                        disabled={addNoteMutation.isPending}
-                        onChange={(e) => setNewNote(e.target.value)}
-                        placeholder="Tulis catatan (misal: Packing kayu, resi kurir, catatan pembeli)..."
-                        className="flex-1 text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:bg-white transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                      />
-                      <button
-                        type="submit"
-                        disabled={addNoteMutation.isPending || !newNote.trim()}
-                        className="px-3 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
-                      >
-                        <Send className="w-3.5 h-3.5" />
-                        Simpan
-                      </button>
-                    </div>
-                  </form>
-                </div>
-
-                {/* Footer Danger Actions */}
-                <div className="pt-2 flex items-center justify-between text-xs text-slate-400">
-                  <span>Nota ID: #{invoiceNumber}</span>
-                  <button
-                    type="button"
-                    onClick={() => setIsDeleteModalOpen(true)}
-                    className="text-red-600 hover:text-red-700 hover:bg-red-50 px-2.5 py-1 rounded transition-colors flex items-center gap-1.5"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    Hapus Transaksi Nota
-                  </button>
-                </div>
-              </>
+                </>
               )
             ) : null}
           </div>
@@ -1039,3 +1279,6 @@ export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
     </div>
   );
 };
+
+// Fix Bottleneck #7: Export memoized component to avoid unnecessary re-renders from parent
+export const OrderDetailSidebar = React.memo(OrderDetailSidebarComponent);

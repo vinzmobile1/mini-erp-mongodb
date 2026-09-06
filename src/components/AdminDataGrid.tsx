@@ -331,6 +331,16 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
     setIsSidebarOpen(true);
   }, []);
 
+  const handleCloseSidebar = useCallback(() => {
+    setIsSidebarOpen(false);
+  }, []);
+
+  const handleSidebarRefreshData = useCallback((silent?: boolean) => {
+    fetchFirstPage(silent);
+    fetchSummaryCounts();
+    onRefresh(silent);
+  }, [fetchFirstPage, fetchSummaryCounts, onRefresh]);
+
   // TanStack Query Mutation with automatic optimistic update, rollback on error, and cache invalidation
   const advanceStatusMutation = useMutation({
     mutationFn: async ({ no_invoice }: { no_invoice: string; previousStatus: OrderStatus; nextStatus: OrderStatus }) => {
@@ -1008,12 +1018,8 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
       <OrderDetailSidebar
         invoiceNumber={selectedInvoice}
         isOpen={isSidebarOpen}
-        onClose={() => setIsSidebarOpen(false)}
-        onRefreshData={(silent) => {
-          fetchFirstPage(silent);
-          fetchSummaryCounts();
-          onRefresh(silent);
-        }}
+        onClose={handleCloseSidebar}
+        onRefreshData={handleSidebarRefreshData}
         onUpdateStatusOptimistic={handleLocalUpdateStatusOptimistic}
         userRole={userRole}
         channels={channels}
