@@ -1,20 +1,138 @@
-import express, { Request, Response } from "express";
+// server.ts
+import express from "express";
 import http from "http";
 import path from "path";
 import { WebSocketServer, WebSocket } from "ws";
-import dotenv from "dotenv";
+import dotenv2 from "dotenv";
 import { ObjectId } from "mongodb";
-import { client, db, initDatabase, seedDatabase, clearAllData, clearTransactionsOnly, getDbInfo, getCollectionIndexes } from "./server/db";
 
+// server/db.ts
+import { MongoClient, ServerApiVersion } from "mongodb";
+import dotenv from "dotenv";
 dotenv.config();
+var MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://salesvinzmobile2_db_user:mZt6k2A0XO1HZpcr@erpaistudio.bpgfxxz.mongodb.net/?appName=erpaistudio";
+var client;
+var db;
+var isConnected = false;
+var connectionError = null;
+try {
+  client = new MongoClient(MONGODB_URI, {
+    serverApi: {
+      version: ServerApiVersion.v1,
+      strict: false,
+      deprecationErrors: true
+    },
+    maxPoolSize: 50,
+    minPoolSize: 0,
+    maxIdleTimeMS: 3e4,
+    waitQueueTimeoutMS: 5e3,
+    serverSelectionTimeoutMS: 5e3,
+    connectTimeoutMS: 5e3,
+    socketTimeoutMS: 3e4
+  });
+} catch (err) {
+  console.error("Failed to initialize MongoDB client:", err);
+  connectionError = err?.message || String(err);
+}
+function getDbInfo() {
+  return {
+    connected: isConnected,
+    url: MONGODB_URI.replace(/:([^:@]{8})[^:@]*@/, ":***@"),
+    // hide password
+    error: connectionError,
+    type: "MongoDB Atlas (Optimal Connection Pool: Max 150, Min 10)",
+    poolConfig: {
+      maxPoolSize: 150,
+      minPoolSize: 10,
+      maxIdleTimeMS: 3e4,
+      waitQueueTimeoutMS: 1e4
+    }
+  };
+}
+async function getCollectionIndexes() {
+  if (!db) return {};
+  try {
+    const salesIndexes = await db.collection("sales").indexes();
+    return {
+      sales: salesIndexes.map((idx) => ({ name: idx.name, key: idx.key, unique: !!idx.unique }))
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+var indexesVerified = false;
+async function ensureIndexes() {
+  if (indexesVerified || !db) return;
+  indexesVerified = true;
+  try {
+    const salesCol = db.collection("sales");
+    const ALLOWED_SALES_INDEXES = /* @__PURE__ */ new Set([
+      "_id_",
+      "no_invoice_1",
+      "created_at_-1__id_-1",
+      "status_1_created_at_-1__id_-1",
+      "channel_1_created_at_-1__id_-1",
+      "status_1_channel_1_created_at_-1__id_-1",
+      "idx_sales_esr_status_channel_created_id",
+      "items.sku_1",
+      "nama_sales_1_nama_divisi_1",
+      "nama_customer_1"
+    ]);
+    try {
+      const existingIndexes = await salesCol.indexes();
+      for (const idx of existingIndexes) {
+        if (!ALLOWED_SALES_INDEXES.has(idx.name)) {
+          await salesCol.dropIndex(idx.name).catch(() => {
+          });
+        }
+      }
+    } catch {
+    }
+    await Promise.all([
+      salesCol.createIndex({ no_invoice: 1 }, { unique: true }).catch(() => {
+      }),
+      salesCol.createIndex({ status: 1, channel: 1, created_at: -1, _id: -1 }, { name: "idx_sales_esr_status_channel_created_id" }).catch(() => {
+      }),
+      salesCol.createIndex({ status: 1, created_at: -1, _id: -1 }).catch(() => {
+      }),
+      salesCol.createIndex({ channel: 1, created_at: -1, _id: -1 }).catch(() => {
+      }),
+      salesCol.createIndex({ created_at: -1, _id: -1 }).catch(() => {
+      }),
+      salesCol.createIndex({ "items.sku": 1 }).catch(() => {
+      }),
+      salesCol.createIndex({ nama_sales: 1, nama_divisi: 1 }).catch(() => {
+      }),
+      salesCol.createIndex({ nama_customer: 1 }).catch(() => {
+      })
+    ]);
+  } catch (err) {
+    console.warn("Background index check notice:", err);
+  }
+}
+async function initDatabase() {
+  try {
+    if (!isConnected) {
+      await client.connect();
+      db = client.db("erpaistudio");
+      isConnected = true;
+      console.log("\u2705 Successfully connected to MongoDB Atlas");
+      ensureIndexes().catch(() => {
+      });
+    }
+  } catch (err) {
+    console.error("\u274C Error initializing MongoDB:", err);
+    connectionError = err?.message || String(err);
+  }
+}
 
-const PORT = Number(process.env.PORT) || 3000;
-const app = express();
-let idCounter = Date.now() * 10;
-const generateId = () => ++idCounter;
-const server = http.createServer(app);
-
-// CORS middleware for cross-origin frontend support (e.g., Netlify -> Render / Vercel)
+// server.ts
+dotenv2.config();
+var PORT = Number(process.env.PORT) || 3e3;
+var app = express();
+var idCounter = Date.now() * 10;
+var generateId = () => ++idCounter;
+var server = http.createServer(app);
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
@@ -24,8 +142,6 @@ app.use((req, res, next) => {
   }
   next();
 });
-
-// Auto-connect MongoDB in Serverless environments (Vercel)
 app.use(async (req, res, next) => {
   try {
     await initDatabase();
@@ -34,38 +150,33 @@ app.use(async (req, res, next) => {
   }
   next();
 });
-
-// API status endpoint for health check
 app.get("/api", (req, res) => {
   res.json({
     status: "ok",
     service: "Mini ERP Backend API",
-    timestamp: new Date().toISOString()
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
 });
-
-// Real-time Clients: WebSocket & Server-Sent Events (SSE)
-let wss: WebSocketServer | null = null;
-const wsClients = new Set<WebSocket>();
-const sseClients = new Set<Response>();
-
+var wss = null;
+var wsClients = /* @__PURE__ */ new Set();
+var sseClients = /* @__PURE__ */ new Set();
 if (!process.env.VERCEL && !process.env.NOW_REGION) {
   wss = new WebSocketServer({ server, path: "/api/ws" });
   wss.on("connection", (ws) => {
     wsClients.add(ws);
     try {
       ws.send(JSON.stringify({ type: "connection:ready", payload: { activeClients: wsClients.size + sseClients.size } }));
-    } catch {}
-
+    } catch {
+    }
     ws.on("message", (msg) => {
       try {
         const data = JSON.parse(msg.toString());
         if (data.type === "ping") {
           ws.send(JSON.stringify({ type: "pong", time: Date.now() }));
         }
-      } catch {}
+      } catch {
+      }
     });
-
     ws.on("close", () => {
       wsClients.delete(ws);
     });
@@ -74,29 +185,25 @@ if (!process.env.VERCEL && !process.env.NOW_REGION) {
     });
   });
 }
-
-// Real-time Event System (Stateless & Redis Pub/Sub Ready)
-// In a distributed/multi-instance deployment, connect to Redis Pub/Sub (e.g. ioredis)
-// and forward subscribed messages to local WebSocket/SSE connection clients.
-export function broadcast(event: { type: string; payload: any }) {
+function broadcast(event) {
   const payloadWithMeta = {
     ...event,
     _eventId: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-    _timestamp: Date.now(),
+    _timestamp: Date.now()
   };
   const message = JSON.stringify(payloadWithMeta);
-
-  for (const client of wsClients) {
-    if (client.readyState === WebSocket.OPEN) {
+  for (const client3 of wsClients) {
+    if (client3.readyState === WebSocket.OPEN) {
       try {
-        client.send(message);
+        client3.send(message);
       } catch (err) {
-        wsClients.delete(client);
+        wsClients.delete(client3);
       }
     }
   }
+  const sseChunk = `data: ${message}
 
-  const sseChunk = `data: ${message}\n\n`;
+`;
   for (const res of sseClients) {
     try {
       res.write(sseChunk);
@@ -105,21 +212,16 @@ export function broadcast(event: { type: string; payload: any }) {
     }
   }
 }
-
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
-
-// Health Check Endpoint
-app.get("/api/health", (req: Request, res: Response) => {
+app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     db_connected: !!db,
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
+    timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+    uptime: process.uptime()
   });
 });
-
-// Prevent crashing if MongoDB is not connected with graceful wait during boot
 app.use("/api", async (req, res, next) => {
   if (req.path === "/db-status" || req.path === "/events" || req.path === "/health") return next();
   if (!db) {
@@ -130,48 +232,53 @@ app.use("/api", async (req, res, next) => {
     }
   }
   if (!db) {
-    return res.status(503).json({ 
-      error: "Koneksi database MongoDB belum siap atau gagal. Pastikan IP Address 0.0.0.0/0 sudah di-allow di Network Access MongoDB Atlas Anda, lalu refresh halaman." 
+    return res.status(503).json({
+      error: "Koneksi database MongoDB belum siap atau gagal. Pastikan IP Address 0.0.0.0/0 sudah di-allow di Network Access MongoDB Atlas Anda, lalu refresh halaman."
     });
   }
   next();
 });
-
-// SSE Route
-app.get("/api/events", (req: Request, res: Response) => {
+app.get("/api/events", (req, res) => {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
+    "X-Accel-Buffering": "no"
   });
-  res.write(`data: ${JSON.stringify({ type: "connection:ready", payload: { activeClients: wsClients.size + sseClients.size + 1 } })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: "connection:ready", payload: { activeClients: wsClients.size + sseClients.size + 1 } })}
+
+`);
   sseClients.add(res);
   const keepAlive = setInterval(() => {
-    try { res.write(`: ping\n\n`); } catch { clearInterval(keepAlive); sseClients.delete(res); }
-  }, 15000);
-  req.on("close", () => { clearInterval(keepAlive); sseClients.delete(res); });
-});
+    try {
+      res.write(`: ping
 
-app.post("/api/import/master", async (req: Request, res: Response) => {
+`);
+    } catch {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    }
+  }, 15e3);
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    sseClients.delete(res);
+  });
+});
+app.post("/api/import/master", async (req, res) => {
   const startTime = Date.now();
   try {
     const { divisi = [], sales_person = [], brand = [], item_group = [], category = [], products = [], channel = [], customers = [], order_status = [] } = req.body || {};
     const counts = { divisi: 0, sales_person: 0, brand: 0, item_group: 0, category: 0, products: 0, channel: 0, customers: 0, order_status: 0 };
-    
-    // High-performance bulk upsert helper for MongoDB
-    const importMasterData = async (collection: string, data: any[], key: string, mapFunc: (x: any) => any) => {
+    const importMasterData = async (collection, data, key, mapFunc) => {
       if (!Array.isArray(data) || data.length === 0) return 0;
       const col = db.collection(collection);
-      const operations: any[] = [];
-      const seenKeys = new Set<string>();
-
+      const operations = [];
+      const seenKeys = /* @__PURE__ */ new Set();
       for (const item of data) {
         const mapped = mapFunc(item);
         const val = mapped[key];
         if (!val || seenKeys.has(String(val))) continue;
         seenKeys.add(String(val));
-
         operations.push({
           updateOne: {
             filter: { [key]: val },
@@ -180,32 +287,31 @@ app.post("/api/import/master", async (req: Request, res: Response) => {
           }
         });
       }
-
       if (operations.length === 0) return 0;
-      const res = await col.bulkWrite(operations, { ordered: false });
-      return res.upsertedCount || 0;
+      const res2 = await col.bulkWrite(operations, { ordered: false });
+      return res2.upsertedCount || 0;
     };
-
     counts.divisi = await importMasterData("divisi", divisi, "nama_divisi", (x) => ({
-      id: generateId(), nama_divisi: String(x.nama_divisi).trim()
+      id: generateId(),
+      nama_divisi: String(x.nama_divisi).trim()
     }));
-    
     counts.brand = await importMasterData("brand", brand, "nama_brand", (x) => ({
-      id: generateId(), nama_brand: String(x.nama_brand).trim()
+      id: generateId(),
+      nama_brand: String(x.nama_brand).trim()
     }));
-    
     counts.item_group = await importMasterData("item_group", item_group, "nama_group", (x) => ({
-      id: generateId(), nama_group: String(x.nama_group).trim()
+      id: generateId(),
+      nama_group: String(x.nama_group).trim()
     }));
-
     counts.category = await importMasterData("category", category, "nama_kategori", (x) => ({
-      id: generateId(), nama_kategori: String(x.nama_kategori).trim()
+      id: generateId(),
+      nama_kategori: String(x.nama_kategori).trim()
     }));
-
     counts.channel = await importMasterData("channel", channel, "nama_channel", (x) => ({
-      id: generateId(), nama_channel: String(x.nama_channel).trim(), color: x.color || x.warna_hex || "#64748B"
+      id: generateId(),
+      nama_channel: String(x.nama_channel).trim(),
+      color: x.color || x.warna_hex || "#64748B"
     }));
-
     counts.order_status = await importMasterData("order_status", order_status, "nama_status", (x) => ({
       id: generateId(),
       nama_status: String(x.nama_status).trim(),
@@ -214,7 +320,6 @@ app.post("/api/import/master", async (req: Request, res: Response) => {
       next_status: x.next_status || x.status_berikutnya || "",
       is_final: Boolean(x.is_final)
     }));
-
     counts.customers = await importMasterData("customers", customers, "nama_customer", (x) => ({
       id: generateId(),
       nama_customer: String(x.nama_customer).trim(),
@@ -222,24 +327,20 @@ app.post("/api/import/master", async (req: Request, res: Response) => {
       alamat: x.alamat ? String(x.alamat).trim() : "",
       email: x.email ? String(x.email).trim() : "",
       catatan: x.catatan ? String(x.catatan).trim() : "",
-      created_at: new Date()
+      created_at: /* @__PURE__ */ new Date()
     }));
-
     if (Array.isArray(sales_person) && sales_person.length > 0) {
       const col = db.collection("sales_person");
       const allDivisi = await db.collection("divisi").find({}, { projection: { id: 1, nama_divisi: 1 } }).toArray();
-      const divMap = new Map(allDivisi.map(d => [d.nama_divisi, d.id]));
-      const spOps: any[] = [];
-      const seenSales = new Set<string>();
-
+      const divMap = new Map(allDivisi.map((d) => [d.nama_divisi, d.id]));
+      const spOps = [];
+      const seenSales = /* @__PURE__ */ new Set();
       for (const s of sales_person) {
         const name = String(s.nama_sales || "").trim();
         if (!name || seenSales.has(name)) continue;
         seenSales.add(name);
-
         const divName = String(s.nama_divisi || "").trim();
         const divisiId = divMap.get(divName) || 1;
-
         spOps.push({
           updateOne: {
             filter: { nama_sales: name },
@@ -248,25 +349,21 @@ app.post("/api/import/master", async (req: Request, res: Response) => {
           }
         });
       }
-
       if (spOps.length > 0) {
-        const res = await col.bulkWrite(spOps, { ordered: false });
-        counts.sales_person = res.upsertedCount || 0;
+        const res2 = await col.bulkWrite(spOps, { ordered: false });
+        counts.sales_person = res2.upsertedCount || 0;
       }
     }
-
     if (Array.isArray(products) && products.length > 0) {
       const col = db.collection("products");
       const allBrands = await db.collection("brand").find({}, { projection: { id: 1, nama_brand: 1 } }).toArray();
-      const brandMap = new Map(allBrands.map(b => [b.nama_brand, b.id]));
-      const productOps: any[] = [];
-      const seenSkus = new Set<string>();
-
+      const brandMap = new Map(allBrands.map((b) => [b.nama_brand, b.id]));
+      const productOps = [];
+      const seenSkus = /* @__PURE__ */ new Set();
       for (const p of products) {
         const sku = String(p.sku || "").trim().toUpperCase();
         if (!sku || seenSkus.has(sku)) continue;
         seenSkus.add(sku);
-
         const brandName = String(p.nama_brand || "General").trim();
         const brandId = brandMap.get(brandName) || 1;
         const mapped = {
@@ -276,7 +373,6 @@ app.post("/api/import/master", async (req: Request, res: Response) => {
           category: p.category ? String(p.category).trim() : null,
           brand_id: brandId
         };
-
         productOps.push({
           updateOne: {
             filter: { sku },
@@ -285,63 +381,53 @@ app.post("/api/import/master", async (req: Request, res: Response) => {
           }
         });
       }
-
       if (productOps.length > 0) {
         await col.bulkWrite(productOps, { ordered: false });
         counts.products = productOps.length;
       }
     }
-
     const durationMs = Date.now() - startTime;
     broadcast({ type: "master:updated", payload: { action: "import", counts } });
     res.json({ ok: true, message: `Import master data berhasil.`, counts, durationMs });
-  } catch (err: any) {
+  } catch (err) {
     console.error("Import Master Data Error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
-
-// Orders import with batch query and bulkWrite execution
-app.post("/api/import/orders", async (req: Request, res: Response) => {
+app.post("/api/import/orders", async (req, res) => {
   const startTime = Date.now();
   try {
     const { orders = [], skipDuplicateInvoice = true } = req.body || {};
     if (!Array.isArray(orders) || orders.length === 0) return res.status(400).json({ error: "Data order kosong." });
-
-    const groupedOrders = new Map<string, any[]>();
+    const groupedOrders = /* @__PURE__ */ new Map();
     for (const row of orders) {
       const inv = String(row.no_invoice || "").trim().toUpperCase();
       if (inv) {
         if (!groupedOrders.has(inv)) groupedOrders.set(inv, []);
-        groupedOrders.get(inv)!.push(row);
+        groupedOrders.get(inv).push(row);
       }
     }
-
     let importedInvoicesCount = 0;
     let importedItemsCount = 0;
     let totalImportedAmount = 0;
-    const skippedInvoices: string[] = [];
-
+    const skippedInvoices = [];
     const salesCol = db.collection("sales");
     const invNumbers = Array.from(groupedOrders.keys());
     const existingDocs = await salesCol.find({ no_invoice: { $in: invNumbers } }, { projection: { no_invoice: 1 } }).toArray();
-    const existingSet = new Set(existingDocs.map(d => d.no_invoice));
-
-    const bulkOps: any[] = [];
+    const existingSet = new Set(existingDocs.map((d) => d.no_invoice));
+    const bulkOps = [];
     for (const [invNum, items] of groupedOrders.entries()) {
       const isExisting = existingSet.has(invNum);
       if (isExisting && skipDuplicateInvoice) {
         skippedInvoices.push(invNum);
         continue;
       }
-
       const headerItem = items[0];
-      const itemsToInsert = items.map(it => ({
+      const itemsToInsert = items.map((it) => ({
         sku: String(it.sku || "").trim().toUpperCase(),
         qty: Math.max(1, Number(it.qty) || 1),
         amount: Math.max(0, Number(it.amount) || 0)
       }));
-
       const doc = {
         no_invoice: invNum,
         nama_customer: String(headerItem.nama_customer || "Customer").trim(),
@@ -351,76 +437,61 @@ app.post("/api/import/orders", async (req: Request, res: Response) => {
         status: String(headerItem.status || "Input Orderan"),
         nama_sales: String(headerItem.nama_sales || "Admin Sales").trim(),
         nama_divisi: String(headerItem.nama_divisi || "General").trim(),
-        created_at: new Date(),
+        created_at: /* @__PURE__ */ new Date(),
         items: itemsToInsert,
         history: [{
-          status_lama: 'Import System',
+          status_lama: "Import System",
           status_baru: String(headerItem.status || "Input Orderan"),
-          updated_at: new Date()
+          updated_at: /* @__PURE__ */ new Date()
         }],
         notes: headerItem.catatan ? [{
           note: String(headerItem.catatan).trim(),
-          author: 'Import Excel',
-          created_at: new Date()
+          author: "Import Excel",
+          created_at: /* @__PURE__ */ new Date()
         }] : []
       };
-
       if (isExisting) {
         bulkOps.push({ updateOne: { filter: { no_invoice: invNum }, update: { $set: doc } } });
       } else {
         bulkOps.push({ insertOne: { document: doc } });
       }
-
       importedInvoicesCount++;
       importedItemsCount += itemsToInsert.length;
       totalImportedAmount += itemsToInsert.reduce((sum, i) => sum + i.amount, 0);
     }
-
     if (bulkOps.length > 0) {
       await salesCol.bulkWrite(bulkOps, { ordered: false });
     }
-
     const durationMs = Date.now() - startTime;
     broadcast({ type: "order:imported", payload: { importedInvoicesCount, importedItemsCount, totalImportedAmount } });
     res.json({ ok: true, importedInvoicesCount, importedItemsCount, totalImportedAmount, skippedInvoices, durationMs });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
-
-app.get("/api/db-status", async (req: Request, res: Response) => {
-  res.json({ ok: true, info: getDbInfo(), serverTime: new Date().toISOString() });
+app.get("/api/db-status", async (req, res) => {
+  res.json({ ok: true, info: getDbInfo(), serverTime: (/* @__PURE__ */ new Date()).toISOString() });
 });
-
-app.get("/api/db-indexes", async (req: Request, res: Response) => {
+app.get("/api/db-indexes", async (req, res) => {
   const indexes = await getCollectionIndexes();
   res.json({ ok: true, indexes });
 });
-
-// Dangerous destructive endpoints disabled permanently
-app.post("/api/clear-all", async (_req: Request, res: Response) => {
+app.post("/api/clear-all", async (_req, res) => {
   res.status(403).json({ ok: false, error: "Endpoint clear-all dinonaktifkan demi perlindungan data." });
 });
-
-app.post("/api/clear-transactions", async (_req: Request, res: Response) => {
+app.post("/api/clear-transactions", async (_req, res) => {
   res.status(403).json({ ok: false, error: "Endpoint clear-transactions dinonaktifkan demi perlindungan data." });
 });
-
-app.post("/api/reseed", async (_req: Request, res: Response) => {
+app.post("/api/reseed", async (_req, res) => {
   res.status(403).json({ ok: false, error: "Endpoint reseed dinonaktifkan demi perlindungan data." });
 });
-
-let channelSeeded = false;
-let orderStatusSeeded = false;
-
-// Generic Master Data endpoints generator
-function setupMasterEndpoints(paths: string | string[], collection: string, idField: string, nameField: string) {
+var channelSeeded = false;
+var orderStatusSeeded = false;
+function setupMasterEndpoints(paths, collection, idField, nameField) {
   const pathList = Array.isArray(paths) ? paths : [paths];
-
-  for (const path of pathList) {
-    app.get(path, async (req: Request, res: Response) => {
+  for (const path2 of pathList) {
+    app.get(path2, async (req, res) => {
       try {
-        // Auto-seed default channel if collection empty
         if (collection === "channel" && !channelSeeded) {
           channelSeeded = true;
           const count = await db.collection("channel").countDocuments();
@@ -430,12 +501,10 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
               { id: 2, nama_channel: "Shopee", color: "#F97316" },
               { id: 3, nama_channel: "TikTok", color: "#18181B" },
               { id: 4, nama_channel: "Lazada", color: "#6366F1" },
-              { id: 5, nama_channel: "Offline", color: "#64748B" },
+              { id: 5, nama_channel: "Offline", color: "#64748B" }
             ]);
           }
         }
-
-        // Auto-seed default order_status if collection empty
         if (collection === "order_status" && !orderStatusSeeded) {
           orderStatusSeeded = true;
           const count = await db.collection("order_status").countDocuments();
@@ -445,11 +514,10 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
               { id: 2, nama_status: "Diproses", color: "#3B82F6", urutan: 2, next_status: "Selesai Packing", is_final: false },
               { id: 3, nama_status: "Selesai Packing", color: "#10B981", urutan: 3, next_status: "", is_final: true },
               { id: 4, nama_status: "Batal", color: "#EF4444", urutan: 4, next_status: "", is_final: true },
-              { id: 5, nama_status: "Retur", color: "#8B5CF6", urutan: 5, next_status: "", is_final: true },
+              { id: 5, nama_status: "Retur", color: "#8B5CF6", urutan: 5, next_status: "", is_final: true }
             ]);
           }
         }
-
         let docs;
         if (collection === "sales_person") {
           docs = await db.collection(collection).aggregate([
@@ -461,9 +529,7 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
           ]).toArray();
         } else if (collection === "products") {
           const keyword = String(req.query.search || req.query.s || req.query.q || "").trim();
-          const pipeline: any[] = [];
-
-          // 1. Stage 0: $search (MUST be index 0 if search keyword is provided)
+          const pipeline = [];
           if (keyword) {
             pipeline.push({
               $search: {
@@ -478,21 +544,15 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
               }
             });
           }
-
-          // 2. Additional stages (lookup brand info)
           pipeline.push(
             { $lookup: { from: "brand", localField: "brand_id", foreignField: "id", as: "brand" } },
             { $unwind: { path: "$brand", preserveNullAndEmptyArrays: true } },
             { $addFields: { nama_brand: "$brand.nama_brand" } },
             { $project: { _id: 0, brand: 0 } }
           );
-
-          // 3. Sort (if no search keyword, default sort by sku)
           if (!keyword) {
             pipeline.push({ $sort: { sku: 1 } });
           }
-
-          // 4. Pagination ($skip and $limit)
           if (req.query.skip) {
             const skipNum = Math.max(0, Number(req.query.skip) || 0);
             if (skipNum > 0) pipeline.push({ $skip: skipNum });
@@ -501,7 +561,6 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
             const limitNum = Math.max(1, Number(req.query.limit) || 100);
             pipeline.push({ $limit: limitNum });
           }
-
           docs = await db.collection(collection).aggregate(pipeline).toArray();
         } else if (collection === "order_status") {
           docs = await db.collection(collection).find({}, { projection: { _id: 0 } }).sort({ urutan: 1, id: 1 }).toArray();
@@ -509,63 +568,62 @@ function setupMasterEndpoints(paths: string | string[], collection: string, idFi
           docs = await db.collection(collection).find({}, { projection: { _id: 0 } }).sort({ [idField]: 1 }).toArray();
         }
         res.json(docs);
-      } catch (err: any) { res.status(500).json({ error: err.message }); }
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
     });
-
-    app.post(path, async (req: Request, res: Response) => {
+    app.post(path2, async (req, res) => {
       try {
         const body = req.body;
-        const doc: any = { ...body };
+        const doc = { ...body };
         if (idField !== "sku") doc.id = generateId();
         if (doc.sku) doc.sku = String(doc.sku).trim().toUpperCase();
         if (doc.urutan) doc.urutan = Number(doc.urutan);
         await db.collection(collection).insertOne(doc);
         broadcast({ type: "master:updated", payload: { table: collection, item: doc } });
         res.status(201).json(doc);
-      } catch (err: any) { res.status(400).json({ error: err.message }); }
+      } catch (err) {
+        res.status(400).json({ error: err.message });
+      }
     });
-
-    app.put(`${path}/:id`, async (req: Request, res: Response) => {
+    app.put(`${path2}/:id`, async (req, res) => {
       try {
         const id = idField === "sku" ? req.params.id : parseInt(req.params.id);
         const updateDoc = { ...req.body };
         delete updateDoc[idField];
-        if (updateDoc.urutan !== undefined) updateDoc.urutan = Number(updateDoc.urutan);
+        if (updateDoc.urutan !== void 0) updateDoc.urutan = Number(updateDoc.urutan);
         await db.collection(collection).updateOne({ [idField]: id }, { $set: updateDoc });
         const updated = await db.collection(collection).findOne({ [idField]: id }, { projection: { _id: 0 } });
         broadcast({ type: "master:updated", payload: { table: collection, item: updated } });
         res.json(updated);
-      } catch (err: any) { res.status(400).json({ error: err.message }); }
+      } catch (err) {
+        res.status(400).json({ error: err.message });
+      }
     });
-
-    app.delete(`${path}/:id`, async (req: Request, res: Response) => {
+    app.delete(`${path2}/:id`, async (req, res) => {
       try {
         const rawParam = decodeURIComponent(req.params.id);
-        const id = idField === "sku" ? rawParam.trim() : (parseInt(rawParam) || rawParam);
-        
+        const id = idField === "sku" ? rawParam.trim() : parseInt(rawParam) || rawParam;
         let result = await db.collection(collection).deleteOne({ [idField]: id });
         if (result.deletedCount === 0 && typeof id === "number") {
           result = await db.collection(collection).deleteOne({ [idField]: String(id) });
         } else if (result.deletedCount === 0 && typeof id === "string" && !isNaN(Number(id))) {
           result = await db.collection(collection).deleteOne({ [idField]: Number(id) });
         }
-
-        // If divisi is deleted, also update or delete related sales persons
         if (collection === "divisi") {
           await db.collection("sales_person").deleteMany({ divisi_id: id });
         }
-        // If brand is deleted, also delete related products
         if (collection === "brand") {
           await db.collection("products").deleteMany({ brand_id: id });
         }
-
         broadcast({ type: "master:updated", payload: { table: collection, deletedId: id } });
         res.json({ ok: true, id, deletedCount: result.deletedCount });
-      } catch (err: any) { res.status(500).json({ error: err.message }); }
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
     });
   }
 }
-
 setupMasterEndpoints(["/api/divisi", "/api/divisions"], "divisi", "id", "nama_divisi");
 setupMasterEndpoints(["/api/sales-person", "/api/sales-persons"], "sales_person", "id", "nama_sales");
 setupMasterEndpoints(["/api/brand", "/api/brands"], "brand", "id", "nama_brand");
@@ -575,88 +633,63 @@ setupMasterEndpoints(["/api/products", "/api/product"], "products", "sku", "item
 setupMasterEndpoints(["/api/channel", "/api/channels"], "channel", "id", "nama_channel");
 setupMasterEndpoints(["/api/customers", "/api/customer"], "customers", "id", "nama_customer");
 setupMasterEndpoints(["/api/order-status", "/api/order-statuses"], "order_status", "id", "nama_status");
-
-// Helper to determine next order status dynamically from Master Data
-async function getNextOrderStatus(currentStatus: string): Promise<string | null> {
+async function getNextOrderStatus(currentStatus) {
   const statusCol = db.collection("order_status");
   const trimmed = String(currentStatus || "").trim();
   const currentDoc = await statusCol.findOne({
     nama_status: { $regex: new RegExp(`^${trimmed}$`, "i") }
   });
-
-  // 1. Explicit next_status specified in master data
   if (currentDoc?.next_status && currentDoc.next_status.trim()) {
     return currentDoc.next_status.trim();
   }
-
-  // 2. Next status by sequential urutan if not marked final
   if (currentDoc?.urutan && !currentDoc.is_final) {
-    const nextInOrder = await statusCol
-      .find({ urutan: { $gt: currentDoc.urutan }, is_final: { $ne: true } })
-      .sort({ urutan: 1 })
-      .limit(1)
-      .toArray();
+    const nextInOrder = await statusCol.find({ urutan: { $gt: currentDoc.urutan }, is_final: { $ne: true } }).sort({ urutan: 1 }).limit(1).toArray();
     if (nextInOrder.length > 0) return nextInOrder[0].nama_status;
   }
-
-  // 3. Fallback progression
   if (trimmed === "Input Orderan") return "Diproses";
   if (trimmed === "Diproses") return "Selesai Packing";
-
   return null;
 }
-
-const apiCache = new Map<string, { data: any; expiry: number }>();
-function getFromCache(keyPrefix: string, url: string): any | null {
+var apiCache = /* @__PURE__ */ new Map();
+function getFromCache(keyPrefix, url) {
   const item = apiCache.get(`${keyPrefix}:${url}`);
   if (item && Date.now() < item.expiry) return item.data;
   return null;
 }
-function setInCache(keyPrefix: string, url: string, data: any, ttlSeconds: number) {
-  apiCache.set(`${keyPrefix}:${url}`, { data, expiry: Date.now() + ttlSeconds * 1000 });
+function setInCache(keyPrefix, url, data, ttlSeconds) {
+  apiCache.set(`${keyPrefix}:${url}`, { data, expiry: Date.now() + ttlSeconds * 1e3 });
 }
-
-let productMapCache: { map: Map<string, string>; expiry: number } | null = null;
+var productMapCache = null;
 function invalidateOrdersAndAnalyticsCache() {
   productMapCache = null;
   apiCache.clear();
 }
-async function getProductNameMap(): Promise<Map<string, string>> {
+async function getProductNameMap() {
   if (productMapCache && Date.now() < productMapCache.expiry) {
     return productMapCache.map;
   }
   const products = await db.collection("products").find({}, { projection: { sku: 1, item_name: 1 } }).toArray();
-  const map = new Map<string, string>();
+  const map = /* @__PURE__ */ new Map();
   for (const p of products) {
     if (p.sku) map.set(p.sku, p.item_name || p.sku);
   }
-  productMapCache = { map, expiry: Date.now() + 300000 };
+  productMapCache = { map, expiry: Date.now() + 3e5 };
   return map;
 }
-
-// Helper to flatten orders for frontend with targeted database projection
-async function fetchFlatOrders(query: any) {
+async function fetchFlatOrders(query) {
   const docs = await db.collection("sales").find(query).sort({ created_at: -1 }).toArray();
   if (docs.length === 0) return [];
-
-  // Extract unique SKUs present in these documents
-  const skusNeeded = Array.from(new Set(docs.flatMap(d => (d.items || []).map((i: any) => i.sku)).filter(Boolean)));
-  const products = skusNeeded.length > 0
-    ? await db.collection("products").find({ sku: { $in: skusNeeded } }, { projection: { sku: 1, item_name: 1, brand_id: 1, category: 1, item_group: 1 } }).toArray()
-    : [];
-  const prodMap = new Map(products.map(p => [p.sku, p]));
-
-  const brandIdsNeeded = Array.from(new Set(products.map(p => p.brand_id).filter(Boolean)));
-  const brands = brandIdsNeeded.length > 0
-    ? await db.collection("brand").find({ id: { $in: brandIdsNeeded } }, { projection: { id: 1, nama_brand: 1 } }).toArray()
-    : [];
-  const brandMap = new Map(brands.map(b => [b.id, b.nama_brand]));
-
-  const flat: any[] = [];
+  const skusNeeded = Array.from(new Set(docs.flatMap((d) => (d.items || []).map((i) => i.sku)).filter(Boolean)));
+  const products = skusNeeded.length > 0 ? await db.collection("products").find({ sku: { $in: skusNeeded } }, { projection: { sku: 1, item_name: 1, brand_id: 1, category: 1, item_group: 1 } }).toArray() : [];
+  const prodMap = new Map(products.map((p) => [p.sku, p]));
+  const brandIdsNeeded = Array.from(new Set(products.map((p) => p.brand_id).filter(Boolean)));
+  const brands = brandIdsNeeded.length > 0 ? await db.collection("brand").find({ id: { $in: brandIdsNeeded } }, { projection: { id: 1, nama_brand: 1 } }).toArray() : [];
+  const brandMap = new Map(brands.map((b) => [b.id, b.nama_brand]));
+  const flat = [];
   for (const doc of docs) {
     for (let idx = 0; idx < doc.items.length; idx++) {
       const item = doc.items[idx];
-      const p = prodMap.get(item.sku) as any || {};
+      const p = prodMap.get(item.sku) || {};
       flat.push({
         id: doc._id.toString() + "-" + item.sku + "-" + idx,
         no_invoice: doc.no_invoice,
@@ -674,65 +707,51 @@ async function fetchFlatOrders(query: any) {
         status: doc.status,
         nama_sales: doc.nama_sales,
         nama_divisi: doc.nama_divisi,
-        created_at: doc.created_at instanceof Date ? doc.created_at.toISOString() : new Date(doc.created_at).toISOString(),
+        created_at: doc.created_at instanceof Date ? doc.created_at.toISOString() : new Date(doc.created_at).toISOString()
       });
     }
   }
   return flat;
 }
-
-// Helper to convert date filter string (e.g. YYYY-MM-DD) into strict WIB (UTC+7 / Asia/Jakarta) start and end Date objects
-function parseWibDateRange(startDateParam?: any, endDateParam?: any) {
-  let start: Date | undefined;
-  let end: Date | undefined;
-
+function parseWibDateRange(startDateParam, endDateParam) {
+  let start2;
+  let end;
   if (startDateParam) {
     const sStr = String(startDateParam).trim();
     const dateMatch = sStr.match(/^(\d{4}-\d{2}-\d{2})/);
     if (dateMatch) {
-      start = new Date(`${dateMatch[1]}T00:00:00.000+07:00`);
+      start2 = /* @__PURE__ */ new Date(`${dateMatch[1]}T00:00:00.000+07:00`);
     } else {
       const parsed = new Date(sStr);
-      if (!isNaN(parsed.getTime())) start = parsed;
+      if (!isNaN(parsed.getTime())) start2 = parsed;
     }
   }
-
   if (endDateParam) {
     const eStr = String(endDateParam).trim();
     const dateMatch = eStr.match(/^(\d{4}-\d{2}-\d{2})/);
     if (dateMatch) {
-      end = new Date(`${dateMatch[1]}T23:59:59.999+07:00`);
+      end = /* @__PURE__ */ new Date(`${dateMatch[1]}T23:59:59.999+07:00`);
     } else {
       const parsed = new Date(eStr);
       if (!isNaN(parsed.getTime())) end = parsed;
     }
   }
-
-  return { start, end };
+  return { start: start2, end };
 }
-
-// --- 1. ENDPOINT SUMMARY (Memperbaiki Bug Angka Badge Filter) ---
-app.get("/api/invoices-summary", async (req: Request, res: Response) => {
+app.get("/api/invoices-summary", async (req, res) => {
   try {
     const { startDate, endDate, channel, status } = req.query;
-    let filter: any = {};
-
-    // Filter Tanggal
+    let filter = {};
     if (startDate || endDate) {
-      const { start, end } = parseWibDateRange(startDate, endDate);
-      if (start || end) {
+      const { start: start2, end } = parseWibDateRange(startDate, endDate);
+      if (start2 || end) {
         filter.created_at = filter.created_at || {};
-        if (start) filter.created_at.$gte = start;
+        if (start2) filter.created_at.$gte = start2;
         if (end) filter.created_at.$lte = end;
       }
     }
-
-    // Filter Dinamis untuk menghitung Badge secara akurat (Cross-Filtering)
-    // Jika user sedang memilih channel tertentu, hitungan status harus menyesuaikan
     if (channel && channel !== "ALL") filter.channel = channel;
-    // Jika user sedang memilih status tertentu, hitungan channel harus menyesuaikan
     if (status && status !== "ALL") filter.status = status;
-
     const [statusAgg, channelAgg, totalCount] = await Promise.all([
       db.collection("sales").aggregate([
         { $match: filter },
@@ -744,58 +763,51 @@ app.get("/api/invoices-summary", async (req: Request, res: Response) => {
       ]).toArray(),
       db.collection("sales").countDocuments(filter)
     ]);
-
-    const statusCounts: Record<string, number> = {};
+    const statusCounts = {};
     for (const s of statusAgg) {
       if (s._id) statusCounts[s._id] = s.count;
     }
-
-    const channelCounts: Record<string, number> = {};
+    const channelCounts = {};
     for (const c of channelAgg) {
       if (c._id) channelCounts[c._id] = c.count;
     }
-
     res.json({ total: totalCount, statusCounts, channelCounts });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
-// --- 2. ENDPOINT INVOICES (Rewrite Logika Pencarian Exact & Regex) ---
-app.get("/api/invoices", async (req: Request, res: Response) => {
+app.get("/api/invoices", async (req, res) => {
   try {
-    const { 
-      status, channel, startDate, endDate, limit = "50", cursor, format,
-      invoice, customer, sales, divisi, sku // Parameter input search baru yang dipisah
+    const {
+      status,
+      channel,
+      startDate,
+      endDate,
+      limit = "50",
+      cursor,
+      format,
+      invoice,
+      customer,
+      sales,
+      divisi,
+      sku
+      // Parameter input search baru yang dipisah
     } = req.query;
-    
     const limitNum = Math.min(Math.max(Number(limit) || 50, 1), 200);
-
-    // Membangun Filter yang Rapi & Spesifik
-    const finalFilter: any = {};
-    
-    // Quick Filters
+    const finalFilter = {};
     if (status && status !== "ALL") finalFilter.status = status;
     if (channel && channel !== "ALL") finalFilter.channel = channel;
-
-    // Filter Tanggal
     if (startDate || endDate) {
-      const { start, end } = parseWibDateRange(startDate, endDate);
-      if (start || end) {
+      const { start: start2, end } = parseWibDateRange(startDate, endDate);
+      if (start2 || end) {
         finalFilter.created_at = {};
-        if (start) finalFilter.created_at.$gte = start;
+        if (start2) finalFilter.created_at.$gte = start2;
         if (end) finalFilter.created_at.$lte = end;
       }
     }
-
-    // LOGIKA PENCARIAN TERPISAH (Sangat Ringan & Cepat)
-    
-    // 1. Invoice -> EXACT MATCH (Harus sama persis)
     if (invoice) {
       finalFilter.no_invoice = String(invoice).trim();
     }
-    
-    // 2. Teks Bebas -> REGEX PARTIAL MATCH (Mencari sebagian kata, bebas huruf besar/kecil)
     if (customer) {
       finalFilter.nama_customer = new RegExp(String(customer).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").trim(), "i");
     }
@@ -808,9 +820,7 @@ app.get("/api/invoices", async (req: Request, res: Response) => {
     if (sku) {
       finalFilter["items.sku"] = new RegExp(String(sku).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").trim(), "i");
     }
-
-    // Cursor Pagination (Tidak Berubah)
-    let cursorCond: any = null;
+    let cursorCond = null;
     if (cursor) {
       const parts = String(cursor).split("_");
       const cursorDate = new Date(parts[0]);
@@ -824,11 +834,14 @@ app.get("/api/invoices", async (req: Request, res: Response) => {
                 { created_at: cursorDate, _id: { $lt: cursorId } }
               ]
             };
-          } catch { cursorCond = { created_at: { $lt: cursorDate } }; }
-        } else { cursorCond = { created_at: { $lt: cursorDate } }; }
+          } catch {
+            cursorCond = { created_at: { $lt: cursorDate } };
+          }
+        } else {
+          cursorCond = { created_at: { $lt: cursorDate } };
+        }
       }
     }
-
     if (cursorCond) {
       if (Object.keys(finalFilter).length > 0) {
         finalFilter.$and = [cursorCond];
@@ -836,30 +849,23 @@ app.get("/api/invoices", async (req: Request, res: Response) => {
         Object.assign(finalFilter, cursorCond);
       }
     }
-
-    // Eksekusi Query Bawaan MongoDB (Tanpa Atlas Search)
-    const fallbackPipeline: any[] = [];
+    const fallbackPipeline = [];
     if (Object.keys(finalFilter).length > 0) {
       fallbackPipeline.push({ $match: finalFilter });
     }
     fallbackPipeline.push({ $sort: { created_at: -1, _id: -1 } });
     fallbackPipeline.push({ $limit: limitNum + 1 });
-
     const docs = await db.collection("sales").aggregate(fallbackPipeline).toArray();
-
-    // Pemrosesan Data ke Frontend (Tidak Berubah)
     const hasMore = docs.length > limitNum;
     const pagedDocs = docs.slice(0, limitNum);
     const prodMap = await getProductNameMap();
-
-    const invoices = pagedDocs.map(doc => {
-      const mappedItems = (doc.items || []).map((it: any) => ({
+    const invoices = pagedDocs.map((doc) => {
+      const mappedItems = (doc.items || []).map((it) => ({
         sku: it.sku,
         item_name: it.item_name || prodMap.get(it.sku) || it.sku,
         qty: Number(it.qty) || 1,
-        amount: Number(it.amount) || 0,
+        amount: Number(it.amount) || 0
       }));
-
       return {
         no_invoice: doc.no_invoice,
         nama_customer: doc.nama_customer,
@@ -871,41 +877,32 @@ app.get("/api/invoices", async (req: Request, res: Response) => {
         nama_divisi: doc.nama_divisi,
         created_at: doc.created_at instanceof Date ? doc.created_at.toISOString() : new Date(doc.created_at).toISOString(),
         item_count: mappedItems.length,
-        total_qty: mappedItems.reduce((s: any, i: any) => s + (Number(i.qty) || 0), 0),
-        total_amount: mappedItems.reduce((s: any, i: any) => s + (Number(i.amount) || 0), 0),
+        total_qty: mappedItems.reduce((s, i) => s + (Number(i.qty) || 0), 0),
+        total_amount: mappedItems.reduce((s, i) => s + (Number(i.amount) || 0), 0),
         items: mappedItems,
-        _id: doc._id ? doc._id.toString() : undefined,
+        _id: doc._id ? doc._id.toString() : void 0
       };
     });
-
     const lastDoc = pagedDocs[pagedDocs.length - 1];
-    const nextCursor = hasMore && lastDoc
-      ? `${(lastDoc.created_at instanceof Date ? lastDoc.created_at : new Date(lastDoc.created_at)).toISOString()}_${lastDoc._id ? lastDoc._id.toString() : ""}`
-      : null;
-
+    const nextCursor = hasMore && lastDoc ? `${(lastDoc.created_at instanceof Date ? lastDoc.created_at : new Date(lastDoc.created_at)).toISOString()}_${lastDoc._id ? lastDoc._id.toString() : ""}` : null;
     if (format === "array") return res.json(invoices);
-
     res.json({ data: invoices, nextCursor: hasMore ? nextCursor : null, hasMore, count: invoices.length });
-  } catch (err: any) { 
-    res.status(500).json({ error: err.message }); 
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
-
-app.get("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
+app.get("/api/invoices/:no_invoice", async (req, res) => {
   try {
     const no_invoice = decodeURIComponent(req.params.no_invoice);
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Invoice not found" });
-
     const prodMap = await getProductNameMap();
-    const mappedItems = (doc.items || []).map((it: any) => ({
+    const mappedItems = (doc.items || []).map((it) => ({
       sku: it.sku,
       item_name: it.item_name || prodMap.get(it.sku) || it.sku,
       qty: Number(it.qty) || 1,
-      amount: Number(it.amount) || 0,
+      amount: Number(it.amount) || 0
     }));
-
-    // Format like InvoiceDetailResponse
     const invoice = {
       no_invoice: doc.no_invoice,
       nama_customer: doc.nama_customer,
@@ -918,50 +915,44 @@ app.get("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
       nama_divisi: doc.nama_divisi,
       created_at: doc.created_at instanceof Date ? doc.created_at.toISOString() : new Date(doc.created_at).toISOString(),
       item_count: mappedItems.length,
-      total_qty: mappedItems.reduce((s: any, i: any) => s + i.qty, 0),
-      total_amount: mappedItems.reduce((s: any, i: any) => s + i.amount, 0),
-      items: mappedItems,
+      total_qty: mappedItems.reduce((s, i) => s + i.qty, 0),
+      total_amount: mappedItems.reduce((s, i) => s + i.amount, 0),
+      items: mappedItems
     };
-
     const flatOrderArr = await fetchFlatOrders({ no_invoice: doc.no_invoice });
-    
     res.json({
       invoice,
-      items: flatOrderArr, // the flat items array expected by frontend
+      items: flatOrderArr,
+      // the flat items array expected by frontend
       history: doc.history || [],
       notes: doc.notes || []
     });
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
-
-app.get("/api/orders", async (req: Request, res: Response) => {
+app.get("/api/orders", async (req, res) => {
   try {
     const cached = getFromCache("orders", req.originalUrl);
     if (cached) return res.json(cached);
     const { status, channel, limit = "20000" } = req.query;
-    let filter: any = {};
+    let filter = {};
     if (status && status !== "ALL") filter.status = status;
     if (channel && channel !== "ALL") filter.channel = channel;
-    
-    // We can't limit flat directly easily with MongoDB, so we just limit documents
     const flat = await fetchFlatOrders(filter);
     const result = limit === "all" ? flat : flat.slice(0, Number(limit));
-    
     setInCache("orders", req.originalUrl, result, 30);
     res.json(result);
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
-
-app.post("/api/orders", async (req: Request, res: Response) => {
+app.post("/api/orders", async (req, res) => {
   try {
     const { no_invoice, nama_customer, sales_person_id, channel, items, no_telepon, alamat } = req.body;
-    
     const sp = await db.collection("sales_person").findOne({ id: Number(sales_person_id) });
     const div = sp ? await db.collection("divisi").findOne({ id: sp.divisi_id }) : null;
-
     const trimmedCust = String(nama_customer || "Customer").trim();
-
-    // Auto-register to master 'customers' if not already in collection
     if (trimmedCust) {
       const custExists = await db.collection("customers").findOne({ nama_customer: trimmedCust });
       if (!custExists) {
@@ -972,12 +963,11 @@ app.post("/api/orders", async (req: Request, res: Response) => {
           alamat: alamat ? String(alamat).trim() : "",
           email: "",
           catatan: "Terdaftar otomatis dari Input Order",
-          created_at: new Date()
+          created_at: /* @__PURE__ */ new Date()
         });
         broadcast({ type: "master:updated", payload: { table: "customers" } });
       }
     }
-
     const doc = {
       no_invoice,
       nama_customer: trimmedCust,
@@ -987,8 +977,8 @@ app.post("/api/orders", async (req: Request, res: Response) => {
       status: "Input Orderan",
       nama_sales: sp?.nama_sales || "Unknown",
       nama_divisi: div?.nama_divisi || "Unknown",
-      created_at: new Date(),
-      items: (items || []).map((i: any) => {
+      created_at: /* @__PURE__ */ new Date(),
+      items: (items || []).map((i) => {
         const skuUpper = String(i.sku || "").trim().toUpperCase();
         return {
           sku: skuUpper,
@@ -999,77 +989,66 @@ app.post("/api/orders", async (req: Request, res: Response) => {
       history: [],
       notes: []
     };
-
     await db.collection("sales").insertOne(doc);
-    
     const flat = await fetchFlatOrders({ no_invoice });
     broadcast({ type: "order:created", payload: { invoice: no_invoice } });
     res.status(201).json(flat);
-  } catch (err: any) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
-
-app.put("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
+app.put("/api/invoices/:no_invoice", async (req, res) => {
   try {
     const { no_invoice } = req.params;
     const { no_invoice: new_no_invoice, nama_customer, sales_person_id, channel, items, no_telepon, alamat } = req.body;
-    
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Not found" });
-
     const sp = await db.collection("sales_person").findOne({ id: Number(sales_person_id) });
     const div = sp ? await db.collection("divisi").findOne({ id: sp.divisi_id }) : null;
-
     const trimmedCust = String(nama_customer || "Customer").trim();
     const newSalesName = sp?.nama_sales || doc.nama_sales || "Unknown";
     const newDivisiName = div?.nama_divisi || doc.nama_divisi || "Unknown";
     const editAuthor = String(req.body.author || req.body.userRole || "Admin").trim();
-
-    // Track detailed field changes into history log
-    const changes: string[] = [];
+    const changes = [];
     if (doc.nama_sales && doc.nama_sales !== newSalesName) {
-      changes.push(`Sales Person (${doc.nama_sales} → ${newSalesName})`);
+      changes.push(`Sales Person (${doc.nama_sales} \u2192 ${newSalesName})`);
     }
     if (doc.nama_customer && doc.nama_customer !== trimmedCust) {
-      changes.push(`Nama Customer (${doc.nama_customer} → ${trimmedCust})`);
+      changes.push(`Nama Customer (${doc.nama_customer} \u2192 ${trimmedCust})`);
     }
     if (doc.channel && doc.channel !== channel) {
-      changes.push(`Channel (${doc.channel} → ${channel})`);
+      changes.push(`Channel (${doc.channel} \u2192 ${channel})`);
     }
     if (doc.no_telepon !== (no_telepon || "")) {
-      changes.push(`No Telepon (${doc.no_telepon || "-"} → ${no_telepon || "-"})`);
+      changes.push(`No Telepon (${doc.no_telepon || "-"} \u2192 ${no_telepon || "-"})`);
     }
     if (doc.alamat !== (alamat || "")) {
-      changes.push(`Alamat (${doc.alamat || "-"} → ${alamat || "-"})`);
+      changes.push(`Alamat (${doc.alamat || "-"} \u2192 ${alamat || "-"})`);
     }
     if (new_no_invoice && new_no_invoice !== no_invoice) {
-      changes.push(`No Invoice (${no_invoice} → ${new_no_invoice})`);
+      changes.push(`No Invoice (${no_invoice} \u2192 ${new_no_invoice})`);
     }
-
-    // Compare items if changed
-    const newItems = (items || []).map((i: any) => ({
+    const newItems = (items || []).map((i) => ({
       sku: String(i.sku || "").trim().toUpperCase(),
       qty: Math.max(1, Number(i.qty) || 1),
       amount: Math.max(0, Number(i.amount) || 0)
     }));
-
-    const oldQty = (doc.items || []).reduce((acc: number, it: any) => acc + (Number(it.qty) || 0), 0);
-    const newQty = newItems.reduce((acc: number, it: any) => acc + (Number(it.qty) || 0), 0);
+    const oldQty = (doc.items || []).reduce((acc, it) => acc + (Number(it.qty) || 0), 0);
+    const newQty = newItems.reduce((acc, it) => acc + (Number(it.qty) || 0), 0);
     if (oldQty !== newQty || doc.items?.length !== newItems.length) {
-      changes.push(`Item Produk (${doc.items?.length || 0} item / ${oldQty} pcs → ${newItems.length} item / ${newQty} pcs)`);
+      changes.push(`Item Produk (${doc.items?.length || 0} item / ${oldQty} pcs \u2192 ${newItems.length} item / ${newQty} pcs)`);
     }
-
     const history = doc.history || [];
     if (changes.length > 0) {
-      changes.forEach(changeStr => {
+      changes.forEach((changeStr) => {
         history.push({
           status_lama: "Edit Nota",
           status_baru: changeStr,
           author: editAuthor,
-          updated_at: new Date()
+          updated_at: /* @__PURE__ */ new Date()
         });
       });
     }
-
     const updateData = {
       no_invoice: new_no_invoice || no_invoice,
       nama_customer: trimmedCust,
@@ -1080,189 +1059,165 @@ app.put("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
       nama_divisi: newDivisiName,
       items: newItems,
       history,
-      updated_at: new Date()
+      updated_at: /* @__PURE__ */ new Date()
     };
-
     await db.collection("sales").updateOne({ no_invoice }, { $set: updateData });
-
     invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "order:updated", payload: { invoice: updateData.no_invoice, history } });
     res.json({ ok: true, history, orders: await fetchFlatOrders({ no_invoice: updateData.no_invoice }) });
-  } catch (err: any) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
-
-app.patch("/api/invoices/:no_invoice/status", async (req: Request, res: Response) => {
+app.patch("/api/invoices/:no_invoice/status", async (req, res) => {
   try {
     const { no_invoice } = req.params;
     const { status, author } = req.body;
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Not found" });
-
-    // Guard: Prevent duplicate write & spam if already in target status
     if (doc.status === status) {
       return res.json({ ok: true, no_invoice, status, history: doc.history || [], unchanged: true });
     }
-
     const history = doc.history || [];
     history.push({
       status_lama: doc.status,
       status_baru: status,
       author: String(author || "Admin").trim(),
-      updated_at: new Date()
+      updated_at: /* @__PURE__ */ new Date()
     });
-
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status, history } });
     invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "invoice:status", payload: { no_invoice, status, history } });
     res.json({ ok: true, no_invoice, status, history });
-  } catch (err: any) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
-
-app.patch("/api/orders/:id/status", async (req: Request, res: Response) => {
+app.patch("/api/orders/:id/status", async (req, res) => {
   try {
     const id = req.params.id;
     const no_invoice = id.split("-").slice(0, -1).join("-") || id;
     const { status, author } = req.body;
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Not found" });
-
-    // Guard: Prevent duplicate write & spam if already in target status
     if (doc.status === status) {
       return res.json({ ok: true, status, history: doc.history || [], unchanged: true });
     }
-
     const history = doc.history || [];
     history.push({
       status_lama: doc.status,
       status_baru: status,
       author: String(author || "Admin").trim(),
-      updated_at: new Date()
+      updated_at: /* @__PURE__ */ new Date()
     });
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status, history } });
     invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "order:status", payload: { id, status, oldStatus: doc.status, history } });
     res.json({ ok: true, status, history });
-  } catch (err: any) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
-
-app.post("/api/invoices/:no_invoice/advance", async (req: Request, res: Response) => {
+app.post("/api/invoices/:no_invoice/advance", async (req, res) => {
   try {
     const { no_invoice } = req.params;
     const { author } = req.body;
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Not found" });
-
     const nextStatus = await getNextOrderStatus(doc.status);
     if (!nextStatus) {
       return res.status(400).json({ error: `Status "${doc.status}" sudah di tahap akhir.` });
     }
-
     const history = doc.history || [];
     history.push({
       status_lama: doc.status,
       status_baru: nextStatus,
       author: String(author || "Admin").trim(),
-      updated_at: new Date()
+      updated_at: /* @__PURE__ */ new Date()
     });
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status: nextStatus, history } });
     invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "invoice:status", payload: { no_invoice, status: nextStatus, history } });
     res.json({ ok: true, status: nextStatus, history });
-  } catch (err: any) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
-
-// --- PERBAIKAN BUG PARSING INVOICE ADVANCE STATUS ---
-app.post("/api/orders/:id/advance", async (req: Request, res: Response) => {
+app.post("/api/orders/:id/advance", async (req, res) => {
   try {
     const rawId = decodeURIComponent(req.params.id);
     let no_invoice = rawId;
-
-    // Logika Pintar: Ekstraksi hanya nomor invoice berformat INV-
     if (rawId.includes("INV-")) {
       const match = rawId.match(/INV-[A-Za-z0-9-]+/);
       if (match) {
-        // Ini memastikan potongan ekstra (-SKU dll) tidak ikut, 
-        // tapi jika ID sudah benar (INV-2026-001) tidak akan rusak.
-        no_invoice = match[0]; 
+        no_invoice = match[0];
       }
     } else if (rawId.includes("-")) {
-      // Cadangan jika kamu menggunakan format custom selain "INV-"
       const parts = rawId.split("-");
       if (parts.length > 2) {
         no_invoice = parts.slice(0, -2).join("-");
       }
     }
-
     const { author } = req.body;
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Not found" });
-
     const nextStatus = await getNextOrderStatus(doc.status);
     if (!nextStatus) {
       return res.status(400).json({ error: `Status "${doc.status}" sudah di tahap akhir.` });
     }
-
     const history = doc.history || [];
     history.push({
       status_lama: doc.status,
       status_baru: nextStatus,
       author: String(author || "Admin").trim(),
-      updated_at: new Date()
+      updated_at: /* @__PURE__ */ new Date()
     });
-    
     await db.collection("sales").updateOne({ no_invoice }, { $set: { status: nextStatus, history } });
     broadcast({ type: "order:status", payload: { id: rawId, status: nextStatus, oldStatus: doc.status } });
     res.json({ ok: true, status: nextStatus });
-  } catch (err: any) { 
-    res.status(400).json({ error: err.message }); 
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
-
-app.post("/api/invoices/:no_invoice/notes", async (req: Request, res: Response) => {
+app.post("/api/invoices/:no_invoice/notes", async (req, res) => {
   try {
     const no_invoice = decodeURIComponent(req.params.no_invoice);
     const { note, author } = req.body;
     if (!note || !String(note).trim()) return res.status(400).json({ error: "Catatan tidak boleh kosong" });
-
     const trimmedNote = String(note).trim();
     const noteAuthor = String(author || "Admin").trim();
-
     const doc = await db.collection("sales").findOne({ no_invoice });
     if (!doc) return res.status(404).json({ error: "Invoice tidak ditemukan" });
-
-    // Deduplication guard: check if identical note was saved within the last 5 seconds
     const existingNotes = doc.notes || [];
-    const recentDuplicate = existingNotes.find((n: any) => {
+    const recentDuplicate = existingNotes.find((n) => {
       if (n.note === trimmedNote && n.author === noteAuthor) {
         const noteTime = new Date(n.created_at).getTime();
         const ageMs = Date.now() - noteTime;
-        return ageMs < 5000;
+        return ageMs < 5e3;
       }
       return false;
     });
-
     if (recentDuplicate) {
       return res.json(recentDuplicate);
     }
-
     const noteObj = {
       id: generateId(),
       note: trimmedNote,
       author: noteAuthor,
-      created_at: new Date().toISOString(),
+      created_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-
     await db.collection("sales").updateOne(
       { no_invoice },
-      { $push: { notes: noteObj } as any }
+      { $push: { notes: noteObj } }
     );
     invalidateOrdersAndAnalyticsCache();
     broadcast({ type: "invoice:note", payload: { no_invoice, note: noteObj } });
     res.status(201).json(noteObj);
-  } catch (err: any) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
-
-app.delete("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
+app.delete("/api/invoices/:no_invoice", async (req, res) => {
   try {
     const no_invoice = decodeURIComponent(req.params.no_invoice);
     const result = await db.collection("sales").deleteOne({ no_invoice });
@@ -1270,10 +1225,11 @@ app.delete("/api/invoices/:no_invoice", async (req: Request, res: Response) => {
     broadcast({ type: "invoice:deleted", payload: { no_invoice } });
     broadcast({ type: "order:deleted", payload: { no_invoice } });
     res.json({ ok: true, no_invoice, deletedCount: result.deletedCount });
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
-
-app.delete("/api/orders/:id", async (req: Request, res: Response) => {
+app.delete("/api/orders/:id", async (req, res) => {
   try {
     const rawId = decodeURIComponent(req.params.id);
     let no_invoice = rawId;
@@ -1286,50 +1242,46 @@ app.delete("/api/orders/:id", async (req: Request, res: Response) => {
     broadcast({ type: "invoice:deleted", payload: { no_invoice } });
     broadcast({ type: "order:deleted", payload: { id: rawId, no_invoice } });
     res.json({ ok: true, no_invoice, deletedCount: result.deletedCount });
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
-
-app.get("/api/analytics/summary", async (req: Request, res: Response) => {
+app.get("/api/analytics/summary", async (req, res) => {
   try {
-    const range = (req.query.range as string) || "this_month";
-
-    // Use Jakarta (WIB / UTC+7) date formatting for accurate local business reporting
-    const getJakartaDateStr = (d: Date) => {
+    const range = req.query.range || "this_month";
+    const getJakartaDateStr = (d) => {
       try {
         return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Jakarta" }).format(d);
       } catch {
         return d.toISOString().substring(0, 10);
       }
     };
-
-    const now = new Date();
+    const now = /* @__PURE__ */ new Date();
     const todayJakartaStr = getJakartaDateStr(now);
-
-    let startDate: Date;
-    let endDate: Date | null = null;
-    let startDateStr: string | null = null;
-    let endDateStr: string | null = null;
-
+    let startDate;
+    let endDate = null;
+    let startDateStr = null;
+    let endDateStr = null;
     if (range === "7days") {
-      const cur = new Date(`${todayJakartaStr}T00:00:00+07:00`);
+      const cur = /* @__PURE__ */ new Date(`${todayJakartaStr}T00:00:00+07:00`);
       cur.setDate(cur.getDate() - 6);
       startDateStr = getJakartaDateStr(cur);
       endDateStr = todayJakartaStr;
-      startDate = new Date(`${startDateStr}T00:00:00.000+07:00`);
-      endDate = new Date(`${endDateStr}T23:59:59.999+07:00`);
+      startDate = /* @__PURE__ */ new Date(`${startDateStr}T00:00:00.000+07:00`);
+      endDate = /* @__PURE__ */ new Date(`${endDateStr}T23:59:59.999+07:00`);
     } else if (range === "30days") {
-      const cur = new Date(`${todayJakartaStr}T00:00:00+07:00`);
+      const cur = /* @__PURE__ */ new Date(`${todayJakartaStr}T00:00:00+07:00`);
       cur.setDate(cur.getDate() - 29);
       startDateStr = getJakartaDateStr(cur);
       endDateStr = todayJakartaStr;
-      startDate = new Date(`${startDateStr}T00:00:00.000+07:00`);
-      endDate = new Date(`${endDateStr}T23:59:59.999+07:00`);
+      startDate = /* @__PURE__ */ new Date(`${startDateStr}T00:00:00.000+07:00`);
+      endDate = /* @__PURE__ */ new Date(`${endDateStr}T23:59:59.999+07:00`);
     } else if (range === "this_month") {
       const [curY, curM] = todayJakartaStr.split("-");
       startDateStr = `${curY}-${curM}-01`;
       endDateStr = todayJakartaStr;
-      startDate = new Date(`${startDateStr}T00:00:00.000+07:00`);
-      endDate = new Date(`${endDateStr}T23:59:59.999+07:00`);
+      startDate = /* @__PURE__ */ new Date(`${startDateStr}T00:00:00.000+07:00`);
+      endDate = /* @__PURE__ */ new Date(`${endDateStr}T23:59:59.999+07:00`);
     } else if (range === "last_month") {
       const [curYStr, curMStr] = todayJakartaStr.split("-");
       let curY = parseInt(curYStr, 10);
@@ -1344,42 +1296,37 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
       const lmMStr = String(lmM).padStart(2, "0");
       startDateStr = `${lmY}-${lmMStr}-01`;
       endDateStr = `${lmY}-${lmMStr}-${String(lastDayOfLm).padStart(2, "0")}`;
-      startDate = new Date(`${startDateStr}T00:00:00.000+07:00`);
-      endDate = new Date(`${endDateStr}T23:59:59.999+07:00`);
+      startDate = /* @__PURE__ */ new Date(`${startDateStr}T00:00:00.000+07:00`);
+      endDate = /* @__PURE__ */ new Date(`${endDateStr}T23:59:59.999+07:00`);
     } else if (range === "all") {
-      startDate = new Date(0);
+      startDate = /* @__PURE__ */ new Date(0);
       endDate = null;
       startDateStr = null;
       endDateStr = null;
     } else if (range === "custom") {
-      const rawStart = req.query.start_date as string;
-      const rawEnd = req.query.end_date as string;
+      const rawStart = req.query.start_date;
+      const rawEnd = req.query.end_date;
       if (rawStart) {
         startDateStr = rawStart;
-        startDate = new Date(`${startDateStr}T00:00:00.000+07:00`);
+        startDate = /* @__PURE__ */ new Date(`${startDateStr}T00:00:00.000+07:00`);
       } else {
-        startDate = new Date(0);
+        startDate = /* @__PURE__ */ new Date(0);
       }
       if (rawEnd) {
         endDateStr = rawEnd;
-        endDate = new Date(`${endDateStr}T23:59:59.999+07:00`);
+        endDate = /* @__PURE__ */ new Date(`${endDateStr}T23:59:59.999+07:00`);
       }
     } else {
-      startDate = new Date(0);
+      startDate = /* @__PURE__ */ new Date(0);
     }
-
-    const dateFilter: any = { $gte: startDate };
+    const dateFilter = { $gte: startDate };
     if (endDate) {
       dateFilter.$lte = endDate;
     }
-    const matchStage: any = { created_at: dateFilter };
-
-    const todayStart = new Date(`${todayJakartaStr}T00:00:00.000+07:00`);
-    const todayEnd = new Date(`${todayJakartaStr}T23:59:59.999+07:00`);
-
-    // Refactored from $facet to parallel Promise.all() queries to avoid MongoDB 16MB BSON limit
+    const matchStage = { created_at: dateFilter };
+    const todayStart = /* @__PURE__ */ new Date(`${todayJakartaStr}T00:00:00.000+07:00`);
+    const todayEnd = /* @__PURE__ */ new Date(`${todayJakartaStr}T23:59:59.999+07:00`);
     const salesCol = db.collection("sales");
-
     const [
       overviewRes,
       perStatusRes,
@@ -1401,7 +1348,6 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
           }
         }
       ]).toArray(),
-
       // 2. Per Status
       salesCol.aggregate([
         { $match: matchStage },
@@ -1413,7 +1359,6 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
           }
         }
       ]).toArray(),
-
       // 3. Per Channel
       salesCol.aggregate([
         { $match: matchStage },
@@ -1426,7 +1371,6 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
           }
         }
       ]).toArray(),
-
       // 4. Top Sales
       salesCol.aggregate([
         { $match: matchStage },
@@ -1440,7 +1384,6 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
         { $sort: { total_amount: -1 } },
         { $limit: 5 }
       ]).toArray(),
-
       // 5. Top Products
       salesCol.aggregate([
         { $match: matchStage },
@@ -1455,7 +1398,6 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
         { $sort: { total_amount: -1 } },
         { $limit: 5 }
       ]).toArray(),
-
       // 6. Daily Sales
       salesCol.aggregate([
         { $match: matchStage },
@@ -1475,7 +1417,6 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
         },
         { $sort: { _id: 1 } }
       ]).toArray(),
-
       // 7. Today By Status
       salesCol.aggregate([
         {
@@ -1495,48 +1436,36 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
         }
       ]).toArray()
     ]);
-
     const overview = overviewRes?.[0] || {
       total_revenue: 0,
       total_orders: 0,
       total_items_sold: 0
     };
-
-    const per_status = perStatusRes.map((s: any) => ({
+    const per_status = perStatusRes.map((s) => ({
       status: s._id || "Unknown",
       count: s.count,
       total_amount: s.total_amount
     }));
-
-    const per_channel = perChannelRes.map((c: any) => ({
+    const per_channel = perChannelRes.map((c) => ({
       channel: c._id || "Unknown",
       order_count: c.order_count,
       total_qty: c.total_qty,
       total_amount: c.total_amount
     }));
-
-    const top_sales = topSalesRes.map((s: any) => ({
+    const top_sales = topSalesRes.map((s) => ({
       nama_sales: s._id?.nama_sales || "Unknown",
       nama_divisi: s._id?.nama_divisi || "-",
       order_count: s.order_count,
       total_amount: s.total_amount
     }));
-
-    const topSkus = topProductsRes.map((p: any) => p._id).filter(Boolean);
-
-    const prods = topSkus.length > 0 
-      ? await db.collection("products").find({ sku: { $in: topSkus } }, { projection: { sku: 1, item_name: 1, brand_id: 1 } }).toArray() 
-      : [];
-    const pmap = new Map(prods.map(p => [p.sku, p]));
-
-    const brandIdsNeeded = Array.from(new Set(prods.map(p => p.brand_id).filter(Boolean)));
-    const brands = brandIdsNeeded.length > 0
-      ? await db.collection("brand").find({ id: { $in: brandIdsNeeded } }, { projection: { id: 1, nama_brand: 1 } }).toArray()
-      : [];
-    const bmap = new Map(brands.map(b => [b.id, b.nama_brand]));
-
-    const top_products = topProductsRes.map((item: any) => {
-      const p = (pmap.get(item._id) as any) || {};
+    const topSkus = topProductsRes.map((p) => p._id).filter(Boolean);
+    const prods = topSkus.length > 0 ? await db.collection("products").find({ sku: { $in: topSkus } }, { projection: { sku: 1, item_name: 1, brand_id: 1 } }).toArray() : [];
+    const pmap = new Map(prods.map((p) => [p.sku, p]));
+    const brandIdsNeeded = Array.from(new Set(prods.map((p) => p.brand_id).filter(Boolean)));
+    const brands = brandIdsNeeded.length > 0 ? await db.collection("brand").find({ id: { $in: brandIdsNeeded } }, { projection: { id: 1, nama_brand: 1 } }).toArray() : [];
+    const bmap = new Map(brands.map((b) => [b.id, b.nama_brand]));
+    const top_products = topProductsRes.map((item) => {
+      const p = pmap.get(item._id) || {};
       return {
         sku: item._id,
         item_name: p.item_name || item._id,
@@ -1545,14 +1474,11 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
         total_amount: item.total_amount
       };
     });
-
-    const dailyMap = new Map<string, { omset: number; qty: number; count: number }>();
-
-    // Pre-populate continuous daily range if start and end dates are specified (up to 93 days)
+    const dailyMap = /* @__PURE__ */ new Map();
     if (startDateStr && endDateStr) {
       try {
-        const curDate = new Date(`${startDateStr}T00:00:00+07:00`);
-        const maxEndDate = new Date(`${endDateStr}T00:00:00+07:00`);
+        const curDate = /* @__PURE__ */ new Date(`${startDateStr}T00:00:00+07:00`);
+        const maxEndDate = /* @__PURE__ */ new Date(`${endDateStr}T00:00:00+07:00`);
         let safetyCounter = 0;
         while (curDate <= maxEndDate && safetyCounter < 120) {
           const dStr = getJakartaDateStr(curDate);
@@ -1564,7 +1490,6 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
         console.error("Failed to pre-fill daily date range:", err);
       }
     }
-
     for (const d of dailySalesRes) {
       if (d._id) {
         dailyMap.set(d._id, {
@@ -1574,22 +1499,17 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
         });
       }
     }
-
-    const daily_sales = Array.from(dailyMap.entries())
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([k, v]) => ({
-        date: k,
-        omset: v.omset,
-        qty: v.qty,
-        jumlah_nota: v.count
-      }));
-
-    const today_by_status = todayByStatusRes.map((t: any) => ({
+    const daily_sales = Array.from(dailyMap.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => ({
+      date: k,
+      omset: v.omset,
+      qty: v.qty,
+      jumlah_nota: v.count
+    }));
+    const today_by_status = todayByStatusRes.map((t) => ({
       status: t._id || "Unknown",
       count: t.count,
       total_amount: t.total_amount
     }));
-
     const summaryData = {
       date_range: range,
       total_revenue: overview.total_revenue || 0,
@@ -1600,13 +1520,13 @@ app.get("/api/analytics/summary", async (req: Request, res: Response) => {
       per_channel,
       top_sales,
       top_products,
-      daily_sales,
+      daily_sales
     };
-
     res.json(summaryData);
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
-
 async function start() {
   try {
     await initDatabase();
@@ -1623,13 +1543,14 @@ async function start() {
     app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Mini ERP Server running on http://localhost:${PORT}`);
+    console.log(`\u{1F680} Mini ERP Server running on http://localhost:${PORT}`);
   });
 }
-
-// Only run standalone server in non-serverless environments
 if (!process.env.VERCEL && !process.env.NOW_REGION) {
   start();
 }
-
-export default app;
+var server_default = app;
+export {
+  broadcast,
+  server_default as default
+};

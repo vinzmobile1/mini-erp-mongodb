@@ -331,16 +331,6 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
     setIsSidebarOpen(true);
   }, []);
 
-  const handleCloseSidebar = useCallback(() => {
-    setIsSidebarOpen(false);
-  }, []);
-
-  const handleSidebarRefreshData = useCallback((silent?: boolean) => {
-    fetchFirstPage(silent);
-    fetchSummaryCounts();
-    onRefresh(silent);
-  }, [fetchFirstPage, fetchSummaryCounts, onRefresh]);
-
   // TanStack Query Mutation with automatic optimistic update, rollback on error, and cache invalidation
   const advanceStatusMutation = useMutation({
     mutationFn: async ({ no_invoice }: { no_invoice: string; previousStatus: OrderStatus; nextStatus: OrderStatus }) => {
@@ -348,14 +338,14 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
     },
     onMutate: async ({ no_invoice, nextStatus }) => {
       setAdvancingInvoice(no_invoice);
+      // Cancel outgoing refetches so they don't overwrite our optimistic update
+      await queryClient.cancelQueries({ queryKey: ["invoices"] });
+
       // Save snapshot of previous invoices
       const previousInvoices = invoices;
 
-      // Optimistically update local state immediately (0ms instant response)
+      // Optimistically update local state
       handleLocalUpdateStatusOptimistic(no_invoice, nextStatus);
-
-      // Cancel outgoing refetches in background so they don't overwrite our optimistic update
-      queryClient.cancelQueries({ queryKey: ["invoices"] });
 
       return { previousInvoices };
     },
@@ -1018,8 +1008,12 @@ export const AdminDataGrid: React.FC<AdminDataGridProps> = ({
       <OrderDetailSidebar
         invoiceNumber={selectedInvoice}
         isOpen={isSidebarOpen}
-        onClose={handleCloseSidebar}
-        onRefreshData={handleSidebarRefreshData}
+        onClose={() => setIsSidebarOpen(false)}
+        onRefreshData={(silent) => {
+          fetchFirstPage(silent);
+          fetchSummaryCounts();
+          onRefresh(silent);
+        }}
         onUpdateStatusOptimistic={handleLocalUpdateStatusOptimistic}
         userRole={userRole}
         channels={channels}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   X,
@@ -24,7 +24,6 @@ import {
   Edit3,
   Phone,
   MapPin,
-  Loader2,
 } from "lucide-react";
 import { InvoiceOrder, InvoiceDetailResponse, OrderStatus, SalesChannel, Channel, OrderStatusMaster, OrderNote } from "../types";
 import { api, formatRupiah, formatDate, parseDateToTimestamp } from "../lib/api";
@@ -98,7 +97,7 @@ const CHANNEL_BADGES: Record<SalesChannel, string> = {
   Offline: "bg-slate-100 text-slate-700 border-slate-300",
 };
 
-const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
+export const OrderDetailSidebar: React.FC<OrderDetailSidebarProps> = ({
   invoiceNumber,
   isOpen,
   onClose,
@@ -131,10 +130,6 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
-  // Instant 0ms optimistic status state for ultra-responsive UI feedback
-  const [optimisticStatus, setOptimisticStatus] = useState<OrderStatus | null>(null);
-  const [isSubmittingStatus, setIsSubmittingStatus] = useState<OrderStatus | null>(null);
-
   // 1. Fetch invoice details using React Query
   const {
     data,
@@ -147,14 +142,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
       return await api.getInvoiceDetail(invoiceNumber);
     },
     enabled: !!isOpen && !!invoiceNumber,
-    staleTime: 30 * 1000,
   });
-
-  // Reset optimistic state when invoiceNumber or underlying server status changes
-  useEffect(() => {
-    setOptimisticStatus(null);
-    setIsSubmittingStatus(null);
-  }, [invoiceNumber, data?.invoice?.status]);
 
   const error = queryErr ? (queryErr as Error).message || "Gagal memuat detail pesanan." : null;
 
@@ -221,45 +209,28 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
     },
   });
 
-  const invoice = data?.invoice;
-  const items = data?.items || [];
-  const history = data?.history || [];
-  const notes = data?.notes || [];
-
-  // Effective status: immediately uses optimisticStatus if available for 0ms visual responsiveness
-  const effectiveStatus: OrderStatus = (optimisticStatus || invoice?.status || "Input Orderan") as OrderStatus;
-
-  // Next status resolver based on master order status settings or default workflow
-  const getNextStatus = (currStatus?: string): OrderStatus | null => {
-    if (!currStatus) return null;
-    if (orderStatuses && orderStatuses.length > 0) {
-      const currentMaster = orderStatuses.find((s) => s.nama_status === currStatus);
-      if (currentMaster?.next_status && !currentMaster.is_final) {
-        return currentMaster.next_status as OrderStatus;
-      }
-    }
-    if (currStatus === "Input Orderan") return "Diproses";
-    if (currStatus === "Diproses") return "Selesai Packing";
-    return null;
-  };
-
-  // 4. React Query Mutations for Status Updates (Non-blocking background sync)
+  // 4. React Query Mutations for Status Updates
   const updateStatusMutation = useMutation({
     mutationFn: async ({ noInvoice, status, author }: { noInvoice: string; status: OrderStatus; author?: string }) => {
       return await api.updateInvoiceStatus(noInvoice, status, author);
     },
-    onMutate: async ({ noInvoice }) => {
-      // Cancel background refetches without blocking synchronous frame
-      const targetKey = ["invoiceDetail", invoiceNumber || noInvoice];
-      queryClient.cancelQueries({ queryKey: targetKey });
-      const previousDetail = queryClient.getQueryData<InvoiceDetailResponse>(targetKey);
+    onMutate: async ({ noInvoice, status }) => {
+      await queryClient.cancelQueries({ queryKey: ["invoiceDetail", noInvoice] });
+      const previousDetail = queryClient.getQueryData<InvoiceDetailResponse>(["invoiceDetail", noInvoice]);
+
+      if (previousDetail && previousDetail.invoice) {
+        queryClient.setQueryData<InvoiceDetailResponse>(["invoiceDetail", noInvoice], {
+          ...previousDetail,
+          invoice: { ...previousDetail.invoice, status },
+          items: previousDetail.items.map((it) => ({ ...it, status })),
+        });
+      }
+      onUpdateStatusOptimistic?.(noInvoice, status);
       return { previousDetail };
     },
     onSuccess: (data: any, { noInvoice, status }) => {
-      setIsSubmittingStatus(null);
-      const targetKey = ["invoiceDetail", invoiceNumber || noInvoice];
       if (data) {
-        queryClient.setQueryData<InvoiceDetailResponse>(targetKey, (prev) => {
+        queryClient.setQueryData<InvoiceDetailResponse>(["invoiceDetail", noInvoice], (prev) => {
           if (!prev) return prev;
           const updatedStatus = data.status || status || prev.invoice.status;
           return {
@@ -275,19 +246,15 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
       }
     },
     onError: (err: any, { noInvoice }, context) => {
-      setIsSubmittingStatus(null);
-      setOptimisticStatus(null);
-      const targetKey = ["invoiceDetail", invoiceNumber || noInvoice];
       if (context?.previousDetail) {
-        queryClient.setQueryData(targetKey, context.previousDetail);
+        queryClient.setQueryData(["invoiceDetail", noInvoice], context.previousDetail);
         if (context.previousDetail.invoice) {
           onUpdateStatusOptimistic?.(noInvoice, context.previousDetail.invoice.status);
         }
       }
       alert(`Gagal memperbarui status: ${err?.message || err}`);
     },
-    onSettled: () => {
-      setIsSubmittingStatus(null);
+    onSettled: (_data, _error, { noInvoice }) => {
       onRefreshData?.(true);
     },
   });
@@ -297,16 +264,26 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
       return await api.advanceInvoiceStatus(noInvoice, author);
     },
     onMutate: async ({ noInvoice }) => {
-      const targetKey = ["invoiceDetail", invoiceNumber || noInvoice];
-      queryClient.cancelQueries({ queryKey: targetKey });
-      const previousDetail = queryClient.getQueryData<InvoiceDetailResponse>(targetKey);
+      await queryClient.cancelQueries({ queryKey: ["invoiceDetail", noInvoice] });
+      const previousDetail = queryClient.getQueryData<InvoiceDetailResponse>(["invoiceDetail", noInvoice]);
+
+      let nextStatus: OrderStatus | null = null;
+      if (previousDetail?.invoice?.status === "Input Orderan") nextStatus = "Diproses";
+      else if (previousDetail?.invoice?.status === "Diproses") nextStatus = "Selesai Packing";
+
+      if (previousDetail && previousDetail.invoice && nextStatus) {
+        queryClient.setQueryData<InvoiceDetailResponse>(["invoiceDetail", noInvoice], {
+          ...previousDetail,
+          invoice: { ...previousDetail.invoice, status: nextStatus },
+          items: previousDetail.items.map((it) => ({ ...it, status: nextStatus })),
+        });
+        onUpdateStatusOptimistic?.(noInvoice, nextStatus);
+      }
       return { previousDetail };
     },
     onSuccess: (data: any, { noInvoice }) => {
-      setIsSubmittingStatus(null);
-      const targetKey = ["invoiceDetail", invoiceNumber || noInvoice];
       if (data) {
-        queryClient.setQueryData<InvoiceDetailResponse>(targetKey, (prev) => {
+        queryClient.setQueryData<InvoiceDetailResponse>(["invoiceDetail", noInvoice], (prev) => {
           if (!prev) return prev;
           const updatedStatus = data.status || prev.invoice.status;
           return {
@@ -322,79 +299,38 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
       }
     },
     onError: (err: any, { noInvoice }, context) => {
-      setIsSubmittingStatus(null);
-      setOptimisticStatus(null);
-      const targetKey = ["invoiceDetail", invoiceNumber || noInvoice];
       if (context?.previousDetail) {
-        queryClient.setQueryData(targetKey, context.previousDetail);
+        queryClient.setQueryData(["invoiceDetail", noInvoice], context.previousDetail);
         if (context.previousDetail.invoice) {
           onUpdateStatusOptimistic?.(noInvoice, context.previousDetail.invoice.status);
         }
       }
       alert(`Gagal memajukan status: ${err?.message || err}`);
     },
-    onSettled: () => {
-      setIsSubmittingStatus(null);
+    onSettled: (_data, _error, { noInvoice }) => {
       onRefreshData?.(true);
     },
   });
 
-  const updatingStatus = Boolean(isSubmittingStatus) || updateStatusMutation.isPending || advanceStatusMutation.isPending;
+  const updatingStatus = updateStatusMutation.isPending || advanceStatusMutation.isPending;
 
-  // Ultra-responsive Instant 0ms Status Change Handler
+  if (!isOpen) return null;
+
+  const invoice = data?.invoice;
+  const items = data?.items || [];
+  const history = data?.history || [];
+  const notes = data?.notes || [];
+
   const handleUpdateStatus = (newStatus: OrderStatus) => {
     const targetInvoice = invoice?.no_invoice || invoiceNumber;
-    if (!targetInvoice) return;
-    if (effectiveStatus === newStatus) return;
-
-    // 1. INSTANT 0ms visual state change (no latency, zero lag)
-    setOptimisticStatus(newStatus);
-    setIsSubmittingStatus(newStatus);
-
-    // 2. Optimistic update parent table row immediately
-    onUpdateStatusOptimistic?.(targetInvoice, newStatus);
-
-    // 3. Immediately update React Query cache synchronously
-    const cacheKey = ["invoiceDetail", invoiceNumber || targetInvoice];
-    queryClient.setQueryData<InvoiceDetailResponse>(cacheKey, (prev) => {
-      if (!prev || !prev.invoice) return prev;
-      return {
-        ...prev,
-        invoice: { ...prev.invoice, status: newStatus },
-        items: prev.items.map((it) => ({ ...it, status: newStatus })),
-      };
-    });
-
-    // 4. Trigger mutation
+    if (!targetInvoice || updateStatusMutation.isPending) return;
+    if (invoice?.status === newStatus) return;
     updateStatusMutation.mutate({ noInvoice: targetInvoice, status: newStatus, author: userRole });
   };
 
-  // Ultra-responsive Instant 0ms Status Advance Handler
   const handleAdvanceStatus = () => {
     const targetInvoice = invoice?.no_invoice || invoiceNumber;
-    if (!targetInvoice) return;
-    const nextSt = getNextStatus(effectiveStatus);
-    if (!nextSt) return;
-
-    // 1. INSTANT 0ms visual state change
-    setOptimisticStatus(nextSt);
-    setIsSubmittingStatus(nextSt);
-
-    // 2. Parent table row instant update
-    onUpdateStatusOptimistic?.(targetInvoice, nextSt);
-
-    // 3. Synchronously update cache
-    const cacheKey = ["invoiceDetail", invoiceNumber || targetInvoice];
-    queryClient.setQueryData<InvoiceDetailResponse>(cacheKey, (prev) => {
-      if (!prev || !prev.invoice) return prev;
-      return {
-        ...prev,
-        invoice: { ...prev.invoice, status: nextSt },
-        items: prev.items.map((it) => ({ ...it, status: nextSt })),
-      };
-    });
-
-    // 4. Trigger mutation
+    if (!targetInvoice || advanceStatusMutation.isPending) return;
     advanceStatusMutation.mutate({ noInvoice: targetInvoice, author: userRole });
   };
 
@@ -451,26 +387,24 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
     }
   };
 
-  // Compile Unified Timeline (memoized to prevent expensive calculation & sorting on every render)
+  // Compile Unified Timeline:
   // 1. Order creation event
   // 2. Status change events
   // 3. User notes
-  const timelineEvents = useMemo(() => {
-    if (!invoice) return [];
+  const timelineEvents: {
+    type: "create" | "status" | "note";
+    id: string;
+    timestamp: string;
+    title: string;
+    description?: string;
+    author?: string;
+    icon: any;
+    color: string;
+  }[] = [];
 
-    const events: {
-      type: "create" | "status" | "note";
-      id: string;
-      timestamp: string;
-      title: string;
-      description?: string;
-      author?: string;
-      icon: any;
-      color: string;
-    }[] = [];
-
+  if (invoice) {
     // 1. Creation event
-    events.push({
+    timelineEvents.push({
       type: "create",
       id: "event-create",
       timestamp: invoice.created_at,
@@ -482,18 +416,6 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
     });
 
     // 2. Status & Edit history
-    const getStatusIcon = (st: string) => {
-      if (st === "Selesai Packing") return CheckCircle2;
-      if (st === "Batal") return X;
-      if (st === "Retur") return RotateCcw;
-      if (st === "Diproses") return Package;
-      return Clock;
-    };
-
-    const getStatusColorCls = (st: string) => {
-      return getStatusColor(st, orderStatuses);
-    };
-
     history.forEach((h, idx) => {
       const authorName = h.author
         ? h.author
@@ -501,9 +423,22 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
         ? "Import Excel"
         : userRole || "Admin";
 
+      const getStatusIcon = (st: string) => {
+        if (st === "Selesai Packing") return CheckCircle2;
+        if (st === "Batal") return X;
+        if (st === "Retur") return RotateCcw;
+        if (st === "Diproses") return Package;
+        return Clock;
+      };
+
+      const getStatusColorCls = (st: string) => {
+        const hex = getStatusColor(st, orderStatuses);
+        return hex;
+      };
+
       const isEditEvent = h.status_lama === "Edit Nota" || h.status_lama?.startsWith("Edit");
 
-      events.push({
+      timelineEvents.push({
         type: "status",
         id: `event-status-${h.id || idx}`,
         timestamp: h.updated_at,
@@ -514,22 +449,9 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
       });
     });
 
-    // 3. Instant Optimistic Status Event (if user just clicked a status)
-    if (optimisticStatus && optimisticStatus !== invoice.status) {
-      events.push({
-        type: "status",
-        id: "event-status-optimistic",
-        timestamp: new Date().toISOString(),
-        title: `Perubahan Status: ${invoice.status} → ${optimisticStatus} (Menyimpan...)`,
-        author: userRole || "Admin",
-        icon: getStatusIcon(optimisticStatus),
-        color: getStatusColorCls(optimisticStatus),
-      });
-    }
-
-    // 4. Notes
+    // 3. Notes
     notes.forEach((n) => {
-      events.push({
+      timelineEvents.push({
         type: "note",
         id: `event-note-${n.id}`,
         timestamp: n.created_at,
@@ -542,33 +464,26 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
     });
 
     // Sort chronologically (oldest to newest for natural timeline story)
-    events.sort((a, b) => {
+    timelineEvents.sort((a, b) => {
       const timeA = parseDateToTimestamp(a.timestamp);
       const timeB = parseDateToTimestamp(b.timestamp);
       return timeA - timeB;
     });
+  }
 
-    return events;
-  }, [invoice, history, notes, orderStatuses, userRole, optimisticStatus]);
-
-  const currentStatusConfig = STATUS_CONFIG[effectiveStatus] || STATUS_CONFIG["Input Orderan"];
-
-  if (!isOpen) return null;
+  const currentStatusConfig = invoice ? STATUS_CONFIG[invoice.status] || STATUS_CONFIG["Input Orderan"] : null;
 
   return (
     <div className="fixed inset-0 z-50 overflow-hidden">
-      {/* Backdrop (solid tinted overlay with GPU acceleration, eliminating heavy backdrop-filter repaint on scroll) */}
+      {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-slate-900/50 transition-opacity duration-200 will-change-opacity pointer-events-auto"
+        className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs transition-opacity duration-300"
         onClick={onClose}
       />
 
-      {/* Slide-over Right Drawer with dedicated GPU composite layer */}
-      <div className="fixed inset-y-0 right-0 max-w-full flex pl-10 pointer-events-none">
-        <div 
-          className="w-screen max-w-2xl bg-white shadow-2xl flex flex-col border-l border-slate-200 pointer-events-auto transform-gpu will-change-transform"
-          style={{ transform: "translate3d(0, 0, 0)" }}
-        >
+      {/* Slide-over Right Drawer */}
+      <div className="fixed inset-y-0 right-0 max-w-full flex pl-10">
+        <div className="w-screen max-w-2xl bg-white shadow-2xl flex flex-col border-l border-slate-200">
           
           {/* Header */}
           <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between shadow-xs">
@@ -605,15 +520,8 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
             </div>
           </div>
 
-          {/* Body Content - Hardware accelerated smooth scrolling container */}
-          <div 
-            className="flex-1 overflow-y-auto p-6 space-y-6 bg-slate-50 overscroll-contain smooth-scroll-container"
-            style={{ 
-              WebkitOverflowScrolling: "touch",
-              willChange: "scroll-position",
-              contain: "paint layout",
-            }}
-          >
+          {/* Body Content */}
+          <div className="flex-1 overflow-y-auto p-6 space-y-6 bg-slate-50/50">
             {loading ? (
               <div className="h-64 flex flex-col items-center justify-center gap-3 text-slate-400">
                 <div className="w-8 h-8 border-3 border-slate-300 border-t-indigo-600 rounded-full animate-spin" />
@@ -665,8 +573,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                         {[...orderStatuses]
                           .sort((a, b) => (a.urutan || 99) - (b.urutan || 99))
                           .map((st, idx) => {
-                            const isCurrent = effectiveStatus === st.nama_status;
-                            const isPendingThis = isSubmittingStatus === st.nama_status;
+                            const isCurrent = invoice.status === st.nama_status;
                             const stColor = getStatusColor(st.nama_status, orderStatuses);
                             const badgeStyle = getDynamicBadgeStyle(stColor);
 
@@ -677,7 +584,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                                 onClick={() => !isCurrent && handleUpdateStatus(st.nama_status as OrderStatus)}
                                 disabled={updatingStatus || isCurrent}
                                 title={isCurrent ? `Posisi Status Saat Ini: ${st.nama_status}` : `Ubah status ke ${st.nama_status}`}
-                                className={`relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-colors duration-75 active:scale-98 ${
+                                className={`relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
                                   isCurrent
                                     ? "ring-2 shadow-xs cursor-default font-bold"
                                     : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 cursor-pointer"
@@ -701,9 +608,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                                         : { backgroundColor: "#e2e8f0", color: "#475569" }
                                     }
                                   >
-                                    {isPendingThis ? (
-                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                    ) : isCurrent ? (
+                                    {isCurrent ? (
                                       <Check className="w-3.5 h-3.5 stroke-[3]" />
                                     ) : (
                                       st.urutan || idx + 1
@@ -721,15 +626,11 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                                       color: stColor,
                                     }}
                                   >
-                                    {isPendingThis ? (
-                                      <Loader2 className="w-2.5 h-2.5 animate-spin" />
-                                    ) : (
-                                      <span
-                                        className="w-1.5 h-1.5 rounded-full animate-pulse transform-gpu"
-                                        style={{ backgroundColor: stColor }}
-                                      />
-                                    )}
-                                    <span>{isPendingThis ? "Menyimpan..." : "Posisi Saat Ini"}</span>
+                                    <span
+                                      className="w-1.5 h-1.5 rounded-full animate-pulse"
+                                      style={{ backgroundColor: stColor }}
+                                    />
+                                    <span>Posisi Saat Ini</span>
                                   </div>
                                 )}
                               </button>
@@ -740,11 +641,10 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                       <>
                         <div className="grid grid-cols-3 gap-2">
                           {(["Input Orderan", "Diproses", "Selesai Packing"] as OrderStatus[]).map((st, idx) => {
-                            const isCurrent = effectiveStatus === st;
-                            const isPendingThis = isSubmittingStatus === st;
+                            const isCurrent = invoice.status === st;
                             const isPast =
-                              (effectiveStatus === "Diproses" && st === "Input Orderan") ||
-                              (effectiveStatus === "Selesai Packing" && (st === "Input Orderan" || st === "Diproses"));
+                              (invoice.status === "Diproses" && st === "Input Orderan") ||
+                              (invoice.status === "Selesai Packing" && (st === "Input Orderan" || st === "Diproses"));
 
                             return (
                               <button
@@ -753,7 +653,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                                 onClick={() => !isCurrent && handleUpdateStatus(st)}
                                 disabled={updatingStatus || isCurrent}
                                 title={isCurrent ? `Posisi Status Saat Ini: ${st}` : `Ubah status ke ${st}`}
-                                className={`relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-colors duration-75 active:scale-98 ${
+                                className={`relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
                                   isCurrent
                                     ? "bg-indigo-50/90 border-indigo-500 ring-2 ring-indigo-500/25 cursor-default shadow-xs"
                                     : isPast
@@ -771,9 +671,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                                         : "bg-slate-200 text-slate-600"
                                     }`}
                                   >
-                                    {isPendingThis ? (
-                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                    ) : isCurrent ? (
+                                    {isCurrent ? (
                                       <Check className="w-3.5 h-3.5 stroke-[3]" />
                                     ) : isPast ? (
                                       "✓"
@@ -787,12 +685,8 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                                 </div>
                                 {isCurrent && (
                                   <div className="mt-1.5 flex items-center gap-1 text-[10px] font-bold text-indigo-700 bg-indigo-100/90 px-1.5 py-0.5 rounded">
-                                    {isPendingThis ? (
-                                      <Loader2 className="w-2.5 h-2.5 animate-spin text-indigo-600" />
-                                    ) : (
-                                      <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-pulse transform-gpu"></span>
-                                    )}
-                                    <span>{isPendingThis ? "Menyimpan..." : "Posisi Saat Ini"}</span>
+                                    <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-pulse"></span>
+                                    <span>Posisi Saat Ini</span>
                                   </div>
                                 )}
                               </button>
@@ -802,59 +696,43 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
 
                         {/* Batal & Retur Fast Buttons */}
                         <div className="grid grid-cols-2 gap-2 pt-1">
-                          {(() => {
-                            const isBatal = effectiveStatus === "Batal";
-                            const isBatalPending = isSubmittingStatus === "Batal";
-                            return (
-                              <button
-                                type="button"
-                                onClick={() => !isBatal && handleUpdateStatus("Batal")}
-                                disabled={updatingStatus || isBatal}
-                                title={isBatal ? "Posisi status saat ini: Batal" : "Tandai pesanan Batal"}
-                                className={`p-2 rounded-lg border text-xs font-bold transition-colors duration-75 active:scale-98 flex items-center justify-center gap-1.5 ${
-                                  isBatal
-                                    ? "bg-rose-100 border-rose-500 text-rose-950 ring-2 ring-rose-400/30 cursor-default shadow-xs"
-                                    : "bg-white hover:bg-rose-50/80 border-rose-200 text-rose-700 cursor-pointer"
-                                }`}
-                              >
-                                {isBatalPending ? (
-                                  <Loader2 className="w-3.5 h-3.5 text-rose-700 animate-spin" />
-                                ) : isBatal ? (
-                                  <Check className="w-3.5 h-3.5 text-rose-700 stroke-[3]" />
-                                ) : (
-                                  <X className="w-3.5 h-3.5" />
-                                )}
-                                <span>{isBatalPending ? "Menyimpan Batal..." : isBatal ? "Batal (Posisi Saat Ini)" : "Tandai Batal"}</span>
-                              </button>
-                            );
-                          })()}
+                          <button
+                            type="button"
+                            onClick={() => invoice.status !== "Batal" && handleUpdateStatus("Batal")}
+                            disabled={updatingStatus || invoice.status === "Batal"}
+                            title={invoice.status === "Batal" ? "Posisi status saat ini: Batal" : "Tandai pesanan Batal"}
+                            className={`p-2 rounded-lg border text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+                              invoice.status === "Batal"
+                                ? "bg-rose-100 border-rose-500 text-rose-950 ring-2 ring-rose-400/30 cursor-default shadow-xs"
+                                : "bg-white hover:bg-rose-50/80 border-rose-200 text-rose-700 cursor-pointer"
+                            }`}
+                          >
+                            {invoice.status === "Batal" ? (
+                              <Check className="w-3.5 h-3.5 text-rose-700 stroke-[3]" />
+                            ) : (
+                              <X className="w-3.5 h-3.5" />
+                            )}
+                            <span>{invoice.status === "Batal" ? "Batal (Posisi Saat Ini)" : "Tandai Batal"}</span>
+                          </button>
 
-                          {(() => {
-                            const isRetur = effectiveStatus === "Retur";
-                            const isReturPending = isSubmittingStatus === "Retur";
-                            return (
-                              <button
-                                type="button"
-                                onClick={() => !isRetur && handleUpdateStatus("Retur")}
-                                disabled={updatingStatus || isRetur}
-                                title={isRetur ? "Posisi status saat ini: Retur" : "Tandai pesanan Retur"}
-                                className={`p-2 rounded-lg border text-xs font-bold transition-colors duration-75 active:scale-98 flex items-center justify-center gap-1.5 ${
-                                  isRetur
-                                    ? "bg-purple-100 border-purple-500 text-purple-950 ring-2 ring-purple-400/30 cursor-default shadow-xs"
-                                    : "bg-white hover:bg-purple-50/80 border-purple-200 text-purple-700 cursor-pointer"
-                                }`}
-                              >
-                                {isReturPending ? (
-                                  <Loader2 className="w-3.5 h-3.5 text-purple-700 animate-spin" />
-                                ) : isRetur ? (
-                                  <Check className="w-3.5 h-3.5 text-purple-700 stroke-[3]" />
-                                ) : (
-                                  <RotateCcw className="w-3.5 h-3.5" />
-                                )}
-                                <span>{isReturPending ? "Menyimpan Retur..." : isRetur ? "Retur (Posisi Saat Ini)" : "Tandai Retur"}</span>
-                              </button>
-                            );
-                          })()}
+                          <button
+                            type="button"
+                            onClick={() => invoice.status !== "Retur" && handleUpdateStatus("Retur")}
+                            disabled={updatingStatus || invoice.status === "Retur"}
+                            title={invoice.status === "Retur" ? "Posisi status saat ini: Retur" : "Tandai pesanan Retur"}
+                            className={`p-2 rounded-lg border text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+                              invoice.status === "Retur"
+                                ? "bg-purple-100 border-purple-500 text-purple-950 ring-2 ring-purple-400/30 cursor-default shadow-xs"
+                                : "bg-white hover:bg-purple-50/80 border-purple-200 text-purple-700 cursor-pointer"
+                            }`}
+                          >
+                            {invoice.status === "Retur" ? (
+                              <Check className="w-3.5 h-3.5 text-purple-700 stroke-[3]" />
+                            ) : (
+                              <RotateCcw className="w-3.5 h-3.5" />
+                            )}
+                            <span>{invoice.status === "Retur" ? "Retur (Posisi Saat Ini)" : "Tandai Retur"}</span>
+                          </button>
                         </div>
                       </>
                     )}
@@ -862,29 +740,24 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
 
                   {/* Advance Button */}
                   {(() => {
-                    const currentMaster = orderStatuses?.find((s) => s.nama_status === effectiveStatus);
+                    const currentMaster = orderStatuses?.find((s) => s.nama_status === invoice.status);
                     const canAdvance = orderStatuses && orderStatuses.length > 0
                       ? !currentMaster?.is_final && currentMaster?.next_status
-                      : effectiveStatus !== "Selesai Packing" && effectiveStatus !== "Batal" && effectiveStatus !== "Retur";
+                      : invoice.status !== "Selesai Packing" && invoice.status !== "Batal" && invoice.status !== "Retur";
 
                     if (!canAdvance) return null;
 
                     const nextTarget = currentMaster?.next_status || currentStatusConfig?.nextLabel || "Lanjutkan Status";
-                    const isAdvancePending = Boolean(isSubmittingStatus && isSubmittingStatus === nextTarget);
 
                     return (
                       <div className="pt-1">
                         <button
                           onClick={handleAdvanceStatus}
                           disabled={updatingStatus}
-                          className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 shadow-xs transition-colors duration-75 active:scale-98 cursor-pointer disabled:opacity-80"
+                          className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 shadow-xs transition-colors"
                         >
-                          {isAdvancePending ? (
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                          ) : (
-                            <ArrowRight className="w-4 h-4" />
-                          )}
-                          <span>{isAdvancePending ? `Menyimpan ke: ${nextTarget}...` : `Lanjutkan ke: ${nextTarget}`}</span>
+                          <ArrowRight className="w-4 h-4" />
+                          <span>Lanjutkan ke: {nextTarget}</span>
                         </button>
                       </div>
                     );
@@ -984,7 +857,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
 
                   <div className="divide-y divide-slate-100">
                     {items.map((item, idx) => (
-                      <div key={item.id || idx} className="p-3.5 hover:bg-slate-100/80 transition-colors flex items-start justify-between gap-3">
+                      <div key={item.id || idx} className="p-3.5 hover:bg-slate-50/70 transition-colors flex items-start justify-between gap-3">
                         <div className="flex items-start gap-3">
                           <span className="w-6 h-6 rounded-md bg-slate-100 text-slate-600 text-xs font-bold flex items-center justify-center flex-shrink-0 mt-0.5">
                             {idx + 1}
@@ -1065,7 +938,7 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
                             <IconComponent className="w-3 h-3" />
                           </div>
 
-                          <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200">
+                          <div className="bg-slate-50/80 rounded-lg p-2.5 border border-slate-200/80">
                             <div className="flex items-center justify-between gap-2 mb-1">
                               <span className="text-xs font-bold text-slate-800">
                                 {evt.title}
@@ -1166,6 +1039,3 @@ const OrderDetailSidebarComponent: React.FC<OrderDetailSidebarProps> = ({
     </div>
   );
 };
-
-export const OrderDetailSidebar = React.memo(OrderDetailSidebarComponent);
-
