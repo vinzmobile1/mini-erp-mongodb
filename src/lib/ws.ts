@@ -227,9 +227,9 @@ class RealtimeClient {
   private startBackgroundSync() {
     if (this.pollingInterval) return;
     // Periodic silent sync:
-    // - Every 5 seconds on Vercel serverless to catch cross-tab updates from MongoDB Atlas
+    // - Every 2 seconds on Vercel serverless (aggressive real-time) to catch cross-tab updates from MongoDB Atlas
     // - Every 12 seconds fallback on long-lived connections if disconnected
-    const intervalMs = this.isServerless ? 5000 : 12000;
+    const intervalMs = this.isServerless ? 2000 : 12000;
     this.pollingInterval = setInterval(() => {
       if (typeof document !== "undefined" && document.visibilityState === "visible") {
         if (this.isServerless || this.status !== "connected") {
